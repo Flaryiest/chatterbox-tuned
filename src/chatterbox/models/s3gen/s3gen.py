@@ -90,7 +90,7 @@ class S3Token2Mel(torch.nn.Module):
             "solver": 'euler',
             "t_scheduler": 'cosine',
             "training_cfg_rate": 0.2,
-            "inference_cfg_rate": 0.7,
+            "inference_cfg_rate": 0.8,
             "reg_loss_type": 'l1',
         })
         decoder = CausalConditionalCFM(
