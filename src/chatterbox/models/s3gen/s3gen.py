@@ -50,8 +50,19 @@ class S3Token2Mel(torch.nn.Module):
 
     TODO: make these modules configurable?
     """
-    def __init__(self):
+    def __init__(self, *, inference_cfg_rate: float = 0.7, speaker_strength: float = 1.0):
+        """
+        Args:
+            inference_cfg_rate: classifier-free guidance rate applied during *inference* inside the
+                conditional flow model (higher => stronger pull toward reference conditioning, but
+                risk of artifacts). Default mirrors original hard-coded 0.7.
+            speaker_strength: multiplicative scaling applied to the speaker embedding (x-vector)
+                before passing into the flow / decoder. Values >1.0 bias output more strongly toward
+                target speaker timbre.
+        """
         super().__init__()
+        self._inference_cfg_rate = inference_cfg_rate
+        self.speaker_strength = speaker_strength
         self.tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
         self.mel_extractor = mel_spectrogram # TODO: make it a torch module?
         self.speaker_encoder = CAMPPlus()  # use default args
@@ -90,7 +101,8 @@ class S3Token2Mel(torch.nn.Module):
             "solver": 'euler',
             "t_scheduler": 'cosine',
             "training_cfg_rate": 0.2,
-            "inference_cfg_rate": 0.8,
+            # was hard-coded 0.7; now parameterized
+            "inference_cfg_rate": float(self._inference_cfg_rate),
             "reg_loss_type": 'l1',
         })
         decoder = CausalConditionalCFM(
@@ -155,13 +167,17 @@ class S3Token2Mel(torch.nn.Module):
             ref_speech_tokens = ref_speech_tokens[:, :ref_mels_24.shape[1] // 2]
             ref_speech_token_lens[0] = ref_speech_tokens.shape[1]
 
-        return dict(
+        ref_dict = dict(
             prompt_token=ref_speech_tokens.to(device),
             prompt_token_len=ref_speech_token_lens,
             prompt_feat=ref_mels_24,
             prompt_feat_len=ref_mels_24_len,
             embedding=ref_x_vector,
         )
+        # apply speaker strength immediately so downstream code doesn't need to remember
+        if self.speaker_strength != 1.0:
+            ref_dict["embedding"] = ref_dict["embedding"] * self.speaker_strength
+        return ref_dict
 
     def forward(
         self,
@@ -200,6 +216,9 @@ class S3Token2Mel(torch.nn.Module):
                     ref_dict[rk] = torch.from_numpy(ref_dict[rk])
                 if torch.is_tensor(ref_dict[rk]):
                     ref_dict[rk] = ref_dict[rk].to(self.device)
+            # Apply speaker strength scaling late if embedding provided pre-computed
+            if self.speaker_strength != 1.0 and "embedding" in ref_dict and torch.is_tensor(ref_dict["embedding"]):
+                ref_dict["embedding"] = ref_dict["embedding"] * self.speaker_strength
 
         if len(speech_tokens.shape) == 1:
             speech_tokens = speech_tokens.unsqueeze(0)
@@ -223,8 +242,8 @@ class S3Token2Wav(S3Token2Mel):
     TODO: make these modules configurable?
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *, inference_cfg_rate: float = 0.7, speaker_strength: float = 1.0):
+        super().__init__(inference_cfg_rate=inference_cfg_rate, speaker_strength=speaker_strength)
 
         f0_predictor = ConvRNNF0Predictor()
         self.mel2wav = HiFTGenerator(
@@ -303,3 +322,22 @@ class S3Token2Wav(S3Token2Mel):
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
 
         return output_wavs, output_sources
+
+    # ----- Extension point setters / helpers -----
+    def set_inference_cfg_rate(self, value: float):
+        """Update the flow guidance rate used at inference time.
+
+        NOTE: This mutates the underlying decoder's config so subsequent calls use the new value.
+        """
+        self._inference_cfg_rate = float(value)
+        # Navigate into flow -> decoder -> cfm params if present
+        if hasattr(self, 'flow') and hasattr(self.flow, 'decoder') and hasattr(self.flow.decoder, 'cfm_params'):
+            try:
+                self.flow.decoder.cfm_params.inference_cfg_rate = float(value)
+            except Exception:
+                pass
+        return self
+
+    def set_speaker_strength(self, value: float):
+        self.speaker_strength = float(value)
+        return self
