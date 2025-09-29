@@ -1,6 +1,9 @@
 from pathlib import Path
+import math
+from typing import Iterable, List
 
 import librosa
+import numpy as np
 import torch
 import perth
 from huggingface_hub import hf_hub_download
@@ -14,25 +17,6 @@ REPO_ID = "ResembleAI/chatterbox"
 
 
 class ChatterboxVC:
-    """Voice conversion interface over S3Gen.
-
-    Features:
-      - Load pretrained/local checkpoints
-      - Single or multi-reference speaker conditioning
-      - Runtime adjustable classifier-free guidance rate (flow stage)
-      - Speaker embedding strength scaling
-      - Optional token pruning (drop earliest tokens)
-      - Watermarking via Perth implicit watermark
-
-    Args:
-        s3gen: Initialized ``S3Gen`` acoustic model instance.
-        device: Torch device string ("cuda", "cpu", "mps", etc.).
-        ref_dict: Optional pre-computed reference conditioning dict.
-        flow_cfg_rate: Classifier-free guidance rate for flow model (0..1+).
-        speaker_strength: Scalar multiplier applied to speaker embedding.
-        prune_tokens: Number of initial tokens to drop before decoding.
-    """
-
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
 
@@ -40,26 +24,22 @@ class ChatterboxVC:
         self,
         s3gen: S3Gen,
         device: str,
-        ref_dict: dict = None,
+        ref_dict: dict=None,
         *,
         flow_cfg_rate: float = 0.8,
         speaker_strength: float = 1.0,
         prune_tokens: int = 0,
-    ) -> None:
-        # Basic validation / clamping (avoid silent misuse)
-        if flow_cfg_rate is not None:
-            flow_cfg_rate = float(flow_cfg_rate)
-        if speaker_strength is not None:
-            speaker_strength = float(speaker_strength)
-        if flow_cfg_rate is not None and flow_cfg_rate < 0:
-            raise ValueError("flow_cfg_rate must be >= 0")
-        if speaker_strength is not None and speaker_strength <= 0:
-            raise ValueError("speaker_strength must be > 0")
-
+        enable_pitch_cache: bool = True,
+    ):
         self.sr = S3GEN_SR
         self.s3gen = s3gen
         self.device = device
         self.watermarker = perth.PerthImplicitWatermarker()
+        # Pitch / prosody caches
+        self._target_median_f0 = None
+        self._enable_pitch_cache = enable_pitch_cache
+        # Track last applied semitone pitch shift (None means no pitch matching attempted)
+        self._last_pitch_shift_semitones = None  # type: float | None
         # configure runtime knobs if supported by underlying model
         if hasattr(self.s3gen, 'set_inference_cfg_rate'):
             self.s3gen.set_inference_cfg_rate(flow_cfg_rate)
@@ -125,78 +105,106 @@ class ChatterboxVC:
             prune_tokens=prune_tokens,
         )
 
-    def set_target_voice(self, wav_fpath: str | Path) -> None:
-        """Set single target voice reference from a wav file.
+    def set_target_voice(self, wav_fpath):
+        ## Load reference wav
+        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
-        Truncates to ``DEC_COND_LEN`` seconds to match training reference length.
-        """
-        wav_fpath = Path(wav_fpath)
-        if not wav_fpath.exists():
-            raise FileNotFoundError(wav_fpath)
-        s3gen_ref_wav, _sr = librosa.load(str(wav_fpath), sr=S3GEN_SR)
-        s3gen_ref_wav = s3gen_ref_wav[: self.DEC_COND_LEN]
+        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
         self.ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+        # Cache target median F0 for later pitch matching
+        if self._enable_pitch_cache:
+            self._target_median_f0 = self._extract_median_f0(s3gen_ref_wav, S3GEN_SR)
 
-    def set_target_voice_multi(
+    # -------- Multi-reference target handling --------
+    def set_target_voices(
         self,
-        wav_fpaths: list[str | Path],
-        *,
-        weights: list[float] | None = None,
-        aggregate: str = "mean",
-    ) -> None:
-        """Set target voice from multiple reference wav files.
+        wav_paths: Iterable[str],
+        mode: str = "mean",
+        robust: bool = True,
+        max_refs: int = 8,
+    ):
+        """Build an aggregated target speaker conditioning from multiple utterances.
+
+        Currently aggregates ONLY the speaker embedding (timbre). The prompt tokens / mels are
+        taken from the *first* utterance to keep shapes consistent. Future improvements could
+        concatenate or randomly sample prompt segments.
 
         Args:
-            wav_fpaths: List of wav paths.
-            weights: Optional list of positive weights (same length). Normalized internally.
-            aggregate: 'mean' (weighted) or 'median'.
-
-        Notes:
-            - Each individual embedding dict contains tensors with shape [...]. We aggregate per-key.
-            - Non-tensor items are copied from the first reference.
+            wav_paths: iterable of wav file paths.
+            mode: 'mean' (others could be added e.g. 'pca').
+            robust: if True, perform a simple outlier rejection on embeddings before averaging.
+            max_refs: safety cap to avoid excessive memory.
         """
-        if not wav_fpaths:
-            raise ValueError("wav_fpaths must be non-empty")
-        paths = [Path(p) for p in wav_fpaths]
-        for p in paths:
-            if not p.exists():
-                raise FileNotFoundError(p)
-        if weights is not None:
-            if len(weights) != len(paths):
-                raise ValueError("weights length must match wav_fpaths length")
-            if any(w < 0 for w in weights):
-                raise ValueError("weights must be non-negative")
-            w = torch.tensor(weights, dtype=torch.float32)
-            if w.sum() == 0:
-                raise ValueError("weights must sum > 0")
-            w = w / w.sum()
+        wav_list = list(wav_paths)[:max_refs]
+        assert len(wav_list) > 0, "No reference paths provided"
+        ref_entries = []
+        for p in wav_list:
+            w, _ = librosa.load(p, sr=S3GEN_SR)
+            w = w[:self.DEC_COND_LEN]
+            ref_entries.append(self.s3gen.embed_ref(w, S3GEN_SR, device=self.device))
+        # Base dict from first
+        base = ref_entries[0]
+        embs = torch.stack([r["embedding"].squeeze(0) for r in ref_entries], dim=0)  # [N, D]
+
+        # Simple robust filtering
+        if robust and embs.size(0) >= 3:
+            with torch.no_grad():
+                dists = torch.cdist(embs, embs)  # [N,N]
+                mean_dist = dists.mean(dim=1)
+                thresh = mean_dist.median() + 1.5 * mean_dist.std()
+                keep_mask = mean_dist <= thresh
+                if keep_mask.sum() >= 2:  # ensure we keep at least two
+                    embs = embs[keep_mask]
+
+        if mode == "mean":
+            agg = embs.mean(dim=0, keepdim=True)
         else:
-            w = torch.ones(len(paths), dtype=torch.float32) / len(paths)
+            raise ValueError(f"Unsupported aggregation mode: {mode}")
+        base["embedding"] = agg
+        self.ref_dict = base
+        if self._enable_pitch_cache:
+            # average median F0 across kept refs
+            f0_vals = []
+            for p in wav_list:
+                try:
+                    w, _ = librosa.load(p, sr=S3GEN_SR)
+                    val = self._extract_median_f0(w, S3GEN_SR)
+                    if val is not None:
+                        f0_vals.append(val)
+                except Exception:
+                    pass
+            if f0_vals:
+                self._target_median_f0 = float(np.median(f0_vals))
+        return self.ref_dict
 
-        # Collect embeddings
-        emb_list = []
-        for p in paths:
-            wav, _sr = librosa.load(str(p), sr=S3GEN_SR)
-            wav = wav[: self.DEC_COND_LEN]
-            emb_list.append(self.s3gen.embed_ref(wav, S3GEN_SR, device=self.device))
+    # -------- Pitch utilities --------
+    def _extract_median_f0(self, wav: np.ndarray | torch.Tensor, sr: int) -> float | None:
+        """Extract a rough median F0 using librosa.pyin. Returns None if extraction fails."""
+        try:
+            if isinstance(wav, torch.Tensor):
+                wav = wav.detach().cpu().numpy()
+            # pyin prefers float64
+            wav64 = wav.astype(np.float64)
+            f0, _, _ = librosa.pyin(
+                wav64,
+                fmin=librosa.note_to_hz('C2'),
+                fmax=librosa.note_to_hz('C7'),
+                sr=sr,
+            )
+            if f0 is None:
+                return None
+            f0_valid = f0[~np.isnan(f0)]
+            if len(f0_valid) == 0:
+                return None
+            return float(np.median(f0_valid))
+        except Exception:
+            return None
 
-        # Keys consistency
-        keys = emb_list[0].keys()
-        out: dict[str, torch.Tensor] = {}
-        for k in keys:
-            if torch.is_tensor(emb_list[0][k]):
-                stack = torch.stack([e[k].to(self.device) * w[i] for i, e in enumerate(emb_list)], dim=0)
-                if aggregate == "mean":
-                    out[k] = stack.sum(dim=0)
-                elif aggregate == "median":
-                    # Convert back to original scale (weights ignored for median)
-                    out[k] = torch.median(stack, dim=0).values
-                else:
-                    raise ValueError("aggregate must be 'mean' or 'median'")
-            else:
-                # Non-tensor value; copy first
-                out[k] = emb_list[0][k]
-        self.ref_dict = out
+    def _compute_semitone_shift(self, src_f0: float, tgt_f0: float, max_shift: float) -> float:
+        if src_f0 is None or tgt_f0 is None or src_f0 <= 0 or tgt_f0 <= 0:
+            return 0.0
+        n_steps = 12.0 * math.log2(tgt_f0 / src_f0)
+        return float(np.clip(n_steps, -max_shift, max_shift))
 
     def generate(
         self,
@@ -206,18 +214,10 @@ class ChatterboxVC:
         prune_tokens: int = None,
         speaker_strength: float = None,
         flow_cfg_rate: float = None,
-        return_dict: bool = False,
+        pitch_match: bool = False,
+        pitch_tolerance: float = 0.4,
+        max_pitch_shift: float = 6.0,
     ):
-        """Generate converted audio.
-
-        Args:
-            audio: Path to source audio wav.
-            target_voice_path: Optional single reference wav (overrides existing ref_dict).
-            prune_tokens: Override prune_tokens for this call.
-            speaker_strength: Override embedding scale.
-            flow_cfg_rate: Override flow guidance rate.
-            return_dict: If True return (audio_tensor, meta_dict) instead of tensor only.
-        """
         if target_voice_path:
             self.set_target_voice(target_voice_path)
         else:
@@ -234,37 +234,37 @@ class ChatterboxVC:
             active_prune = self.prune_tokens
 
         with torch.inference_mode():
-            src_wav, _ = librosa.load(audio, sr=S3_SR)
-            src_wav_t = torch.from_numpy(src_wav).float().to(self.device)[None, ]
+            audio_16, _ = librosa.load(audio, sr=S3_SR)
+            audio_16 = torch.from_numpy(audio_16).float().to(self.device)[None, ]
 
-            s3_tokens, _ = self.s3gen.tokenizer(src_wav_t)
-            token_count_before = s3_tokens.size(1)
+            # Optional pitch matching BEFORE tokenization
+            if pitch_match and self._target_median_f0 is not None:
+                src_med_f0 = self._extract_median_f0(audio_16.squeeze(0).cpu().numpy(), S3_SR)
+                shift = self._compute_semitone_shift(src_med_f0, self._target_median_f0, max_pitch_shift)
+                # Avoid micro shifts that add noise
+                if abs(shift) > pitch_tolerance:
+                    try:
+                        shifted = librosa.effects.pitch_shift(audio_16.squeeze(0).cpu().numpy(), sr=S3_SR, n_steps=shift)
+                        audio_16 = torch.from_numpy(shifted).float().to(self.device).unsqueeze(0)
+                        self._last_pitch_shift_semitones = float(shift)
+                    except Exception:
+                        self._last_pitch_shift_semitones = None
+                else:
+                    self._last_pitch_shift_semitones = 0.0
+            else:
+                self._last_pitch_shift_semitones = None
+
+            s3_tokens, _ = self.s3gen.tokenizer(audio_16)
             if active_prune > 0 and s3_tokens.size(1) > active_prune:
                 s3_tokens = s3_tokens[:, active_prune:]
-            token_count_after = s3_tokens.size(1)
             wav, _ = self.s3gen.inference(
                 speech_tokens=s3_tokens,
                 ref_dict=self.ref_dict,
             )
-            wav_np = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav_np, sample_rate=self.sr)
+            wav = wav.squeeze(0).detach().cpu().numpy()
+            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
-        audio_out = torch.from_numpy(watermarked_wav).unsqueeze(0)
-        if not return_dict:
-            return audio_out
-        # Gather meta diagnostics
-        cfg_rate = None
-        spk_strength = None
-        if hasattr(self.s3gen, '_inference_cfg_rate'):
-            cfg_rate = getattr(self.s3gen, '_inference_cfg_rate')
-        if hasattr(self.s3gen, 'speaker_strength'):
-            spk_strength = getattr(self.s3gen, 'speaker_strength')
-        meta = {
-            'tokens_before': int(token_count_before),
-            'tokens_after': int(token_count_after),
-            'pruned': int(token_count_before - token_count_after),
-            'active_prune': int(active_prune),
-            'flow_cfg_rate': cfg_rate,
-            'speaker_strength': spk_strength,
-        }
-        return audio_out, meta
+    def get_last_pitch_shift(self) -> float | None:
+        """Return the semitone pitch shift applied in the most recent generate call (if any)."""
+        return self._last_pitch_shift_semitones

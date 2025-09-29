@@ -21,14 +21,15 @@ from chatterbox.models.voice_encoder import VoiceEncoder
 
 # ---------------- User Config ----------------
 # (Only the final assignment to AUDIO_PATH is used; remove or comment out unused examples.)
-AUDIO_PATH = "/content/matrix.mp3"
-AUDIO_PATH = "/content/TaylorSwiftShort.wav"  # Active source
-
-TARGET_VOICE_PATH = "/content/Barack Obama.mp3"  # Target speaker reference
+SOURCE_AUDIO = "/content/TaylorSwiftShort.wav"  # Active source
+TARGET_VOICE_PATH = "/content/Barack Obama.mp3"  # Single target reference
 
 FLOW_CFG_RATE = 0.90        # Strong style guidance (try 0.82–0.88 first if artifacts)
 SPEAKER_STRENGTH = 1.25     # Embedding scaling (1.15–1.30 typical)
 PRUNE_TOKENS = 0            # Try 4–8 to reduce source leakage
+ENABLE_PITCH_MATCH = True   # Use pitch matching hook
+PITCH_TOLERANCE = 0.4       # Ignore tiny shifts (semitones)
+MAX_PITCH_SHIFT = 6.0       # Clamp extreme shifts
 RUN_VARIANT_SWEEP = False   # Set True to automatically evaluate a small grid
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -41,6 +42,9 @@ model = ChatterboxVC.from_pretrained(
     speaker_strength=SPEAKER_STRENGTH,
     prune_tokens=PRUNE_TOKENS,
 )
+
+# Prepare target conditioning (single reference)
+model.set_target_voice(TARGET_VOICE_PATH)
 
 def generate_with_introspection(model, audio_path, target_path, **override):
     """Generate audio while logging active parameters and token stats."""
@@ -64,8 +68,11 @@ def generate_with_introspection(model, audio_path, target_path, **override):
 # ---------------- Conversion (Primary) ----------------
 wav = generate_with_introspection(
     model,
-    AUDIO_PATH,
+    SOURCE_AUDIO,
     TARGET_VOICE_PATH,
+    pitch_match=ENABLE_PITCH_MATCH,
+    pitch_tolerance=PITCH_TOLERANCE,
+    max_pitch_shift=MAX_PITCH_SHIFT,
 )
 
 out_path = "/content/output.wav"
@@ -73,7 +80,7 @@ sf.write(out_path, wav.squeeze(0).cpu().numpy(), model.sr)
 
 display(Audio(filename=out_path, rate=model.sr))
 print("Saved:", out_path)
-print(f"Settings -> flow_cfg_rate={FLOW_CFG_RATE}, speaker_strength={SPEAKER_STRENGTH}, prune_tokens={PRUNE_TOKENS}")
+print(f"Settings -> flow_cfg_rate={FLOW_CFG_RATE}, speaker_strength={SPEAKER_STRENGTH}, prune_tokens={PRUNE_TOKENS}, pitch_match={ENABLE_PITCH_MATCH}")
 
 # ---------------- Identity Shift Evaluation ----------------
 def load_embeds_utterance(path: str, ve: VoiceEncoder, sr_target: int = 16000):
@@ -94,7 +101,7 @@ def l2(a: torch.Tensor, b: torch.Tensor):
 
 voice_encoder = VoiceEncoder().to(device).eval()
 
-source_spk, source_partials = load_embeds_utterance(AUDIO_PATH, voice_encoder)
+source_spk, source_partials = load_embeds_utterance(SOURCE_AUDIO, voice_encoder)
 target_spk, target_partials = load_embeds_utterance(TARGET_VOICE_PATH, voice_encoder)
 output_spk, output_partials = load_embeds_utterance(out_path, voice_encoder)
 
@@ -140,11 +147,14 @@ Set RUN_VARIANT_SWEEP=True at top to enable. Produces a table of metrics for dif
 def run_variant(tag, flow_cfg_rate=None, speaker_strength=None, prune_tokens=None):
     wav_v = generate_with_introspection(
         model,
-        AUDIO_PATH,
+        SOURCE_AUDIO,
         TARGET_VOICE_PATH,
         flow_cfg_rate=flow_cfg_rate,
         speaker_strength=speaker_strength,
         prune_tokens=prune_tokens,
+        pitch_match=ENABLE_PITCH_MATCH,
+        pitch_tolerance=PITCH_TOLERANCE,
+        max_pitch_shift=MAX_PITCH_SHIFT,
     )
     p = f"/content/output_{tag}.wav"
     sf.write(p, wav_v.squeeze(0).cpu().numpy(), model.sr)
