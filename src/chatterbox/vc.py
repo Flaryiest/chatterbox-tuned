@@ -240,16 +240,33 @@ class ChatterboxVC:
             # Optional pitch matching BEFORE tokenization
             if pitch_match and self._target_median_f0 is not None:
                 src_med_f0 = self._extract_median_f0(audio_16.squeeze(0).cpu().numpy(), S3_SR)
-                shift = self._compute_semitone_shift(src_med_f0, self._target_median_f0, max_pitch_shift)
-                # Avoid micro shifts that add noise
-                if abs(shift) > pitch_tolerance:
+                raw_shift = self._compute_semitone_shift(src_med_f0, self._target_median_f0, max_pitch_shift)
+                # Dead zone: ignore small absolute shifts (< 1 semitone)
+                if abs(raw_shift) < 1.0:
+                    effective_shift = 0.0
+                else:
+                    # Soft ramp: subtract dead-zone margin then scale
+                    sign = 1.0 if raw_shift > 0 else -1.0
+                    effective_shift = (abs(raw_shift) - 1.0) * 0.5 * sign  # shrink aggressiveness
+                # Additional global scaling factor
+                effective_shift *= 0.8
+                # Clamp tighter than original max to preserve intelligibility
+                if effective_shift > 3.0:
+                    effective_shift = 3.0
+                elif effective_shift < -3.0:
+                    effective_shift = -3.0
+
+                if abs(effective_shift) > pitch_tolerance and effective_shift != 0.0:
                     try:
-                        shifted = librosa.effects.pitch_shift(audio_16.squeeze(0).cpu().numpy(), sr=S3_SR, n_steps=shift)
+                        shifted = librosa.effects.pitch_shift(
+                            audio_16.squeeze(0).cpu().numpy(), sr=S3_SR, n_steps=effective_shift
+                        )
                         audio_16 = torch.from_numpy(shifted).float().to(self.device).unsqueeze(0)
-                        self._last_pitch_shift_semitones = float(shift)
+                        self._last_pitch_shift_semitones = float(effective_shift)
                     except Exception:
                         self._last_pitch_shift_semitones = None
                 else:
+                    # Either below tolerance or no effective shift
                     self._last_pitch_shift_semitones = 0.0
             else:
                 self._last_pitch_shift_semitones = None
