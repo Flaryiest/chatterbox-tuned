@@ -114,7 +114,17 @@ class ConditionalCFM(BASECFM):
             mask_in[:] = mask
             mu_in[0] = mu
             t_in[:] = t.unsqueeze(0)
-            spks_in[0] = spks
+            # Optional progressive speaker scaling schedule
+            if hasattr(self, '_spk_scale_schedule'):
+                try:
+                    scale = self._spk_scale_schedule[step - 1]
+                    if isinstance(scale, torch.Tensor):
+                        scale = float(scale.item())
+                except Exception:
+                    scale = 1.0
+                spks_in[0] = spks * scale
+            else:
+                spks_in[0] = spks
             cond_in[0] = cond
             dphi_dt = self.forward_estimator(
                 x_in, mask_in,
@@ -123,7 +133,17 @@ class ConditionalCFM(BASECFM):
                 cond_in
             )
             dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
+            # Optional per-step guidance (CFG) schedule
+            if hasattr(self, '_cfg_rate_schedule'):
+                try:
+                    cfg_rate = self._cfg_rate_schedule[step - 1]
+                    if isinstance(cfg_rate, torch.Tensor):
+                        cfg_rate = float(cfg_rate.item())
+                except Exception:
+                    cfg_rate = self.inference_cfg_rate
+            else:
+                cfg_rate = self.inference_cfg_rate
+            dphi_dt = ((1.0 + cfg_rate) * dphi_dt - cfg_rate * cfg_dphi_dt)
             x = x + dt * dphi_dt
             t = t + dt
             sol.append(x)

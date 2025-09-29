@@ -217,10 +217,16 @@ class ChatterboxVC:
         pitch_match: bool = False,
         pitch_tolerance: float = 0.4,
         max_pitch_shift: float = 6.0,
+        guidance_ramp: bool | None = None,
+        guidance_ramp_min: float = 0.55,
+        guidance_ramp_max: float = None,
+        speaker_ramp: bool | None = None,
+        speaker_ramp_start: float = 0.6,
+        ramp_shape: str = "sigmoid",
     ):
         if target_voice_path:
             self.set_target_voice(target_voice_path)
-        else:
+        if target_voice_path is None:
             assert self.ref_dict is not None, "Please `prepare_conditionals` first or specify `target_voice_path`"
 
         # Allow per-call overrides
@@ -274,6 +280,45 @@ class ChatterboxVC:
             s3_tokens, _ = self.s3gen.tokenizer(audio_16)
             if active_prune > 0 and s3_tokens.size(1) > active_prune:
                 s3_tokens = s3_tokens[:, active_prune:]
+            # -------- Optional scheduling (guidance & speaker scaling) --------
+            # Number of internal flow steps is currently fixed at 10 (see flow_matching inference call n_timesteps)
+            n_steps = 10
+
+            # Guidance ramp: if enabled, build per-step cfg schedule
+            if guidance_ramp is None:
+                guidance_ramp = False
+            if guidance_ramp:
+                base_cfg = guidance_ramp_min
+                target_cfg = flow_cfg_rate if flow_cfg_rate is not None else getattr(self.s3gen, '_inference_cfg_rate', 0.8)
+                peak_cfg = guidance_ramp_max if guidance_ramp_max is not None else target_cfg
+                if ramp_shape == "sigmoid":
+                    xs = torch.linspace(-4, 4, n_steps)
+                    sig = torch.sigmoid(xs)
+                    cfg_sched = (base_cfg + (peak_cfg - base_cfg) * sig).tolist()
+                else:
+                    cfg_sched = torch.linspace(base_cfg, peak_cfg, n_steps).tolist()
+                self.s3gen.set_cfg_rate_schedule(cfg_sched)
+            else:
+                if hasattr(self.s3gen, 'set_cfg_rate_schedule'):
+                    self.s3gen.set_cfg_rate_schedule(None)
+
+            # Speaker scaling ramp
+            if speaker_ramp is None:
+                speaker_ramp = False
+            if speaker_ramp:
+                final_strength = speaker_strength if speaker_strength is not None else getattr(self.s3gen, 'speaker_strength', 1.0)
+                start_strength = speaker_ramp_start
+                if ramp_shape == "sigmoid":
+                    xs = torch.linspace(-4, 4, n_steps)
+                    sig = torch.sigmoid(xs)
+                    scales = (start_strength + (final_strength - start_strength) * sig) / max(final_strength, 1e-6)
+                else:
+                    scales = torch.linspace(start_strength, final_strength, n_steps) / max(final_strength, 1e-6)
+                self.s3gen.set_speaker_scale_schedule(scales.tolist())
+            else:
+                if hasattr(self.s3gen, 'set_speaker_scale_schedule'):
+                    self.s3gen.set_speaker_scale_schedule(None)
+            # Now run inference with schedules applied
             wav, _ = self.s3gen.inference(
                 speech_tokens=s3_tokens,
                 ref_dict=self.ref_dict,

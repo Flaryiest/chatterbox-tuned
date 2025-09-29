@@ -345,3 +345,32 @@ class S3Token2Wav(S3Token2Mel):
     def set_speaker_strength(self, value: float):
         self.speaker_strength = float(value)
         return self
+
+    # -------- Scheduling helpers (optional inference tricks) --------
+    def set_cfg_rate_schedule(self, schedule: list[float] | None):
+        """Provide a per-step guidance (CFG) schedule.
+
+        Length should equal the number of internal flow steps (currently 10). If None, removes schedule.
+        """
+        if schedule is None:
+            if hasattr(self.flow.decoder, '_cfg_rate_schedule'):
+                delattr(self.flow.decoder, '_cfg_rate_schedule')
+            return self
+        sched = [float(x) for x in schedule]
+        if hasattr(self.flow, 'decoder'):
+            setattr(self.flow.decoder, '_cfg_rate_schedule', sched)
+        return self
+
+    def set_speaker_scale_schedule(self, schedule: list[float] | None):
+        """Provide a per-step multiplicative scale applied to the (projected) speaker embedding.
+
+        Length should equal number of internal flow steps (10). Values typically ramp 0.5 -> 1.0.
+        """
+        if schedule is None:
+            if hasattr(self.flow.decoder, '_spk_scale_schedule'):
+                delattr(self.flow.decoder, '_spk_scale_schedule')
+            return self
+        sched = [float(x) for x in schedule]
+        if hasattr(self.flow, 'decoder'):
+            setattr(self.flow.decoder, '_spk_scale_schedule', sched)
+        return self
