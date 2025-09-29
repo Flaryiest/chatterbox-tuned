@@ -172,8 +172,11 @@ class S3Token2Mel(torch.nn.Module):
             prompt_token_len=ref_speech_token_lens,
             prompt_feat=ref_mels_24,
             prompt_feat_len=ref_mels_24_len,
-            embedding_raw=ref_x_vector,  # store raw so scaling can be changed dynamically
+            embedding=ref_x_vector,
         )
+        # apply speaker strength immediately so downstream code doesn't need to remember
+        if self.speaker_strength != 1.0:
+            ref_dict["embedding"] = ref_dict["embedding"] * self.speaker_strength
         return ref_dict
 
     def forward(
@@ -213,14 +216,13 @@ class S3Token2Mel(torch.nn.Module):
                     ref_dict[rk] = torch.from_numpy(ref_dict[rk])
                 if torch.is_tensor(ref_dict[rk]):
                     ref_dict[rk] = ref_dict[rk].to(self.device)
+            # Apply speaker strength scaling late if embedding provided pre-computed
+            if self.speaker_strength != 1.0 and "embedding" in ref_dict and torch.is_tensor(ref_dict["embedding"]):
+                ref_dict["embedding"] = ref_dict["embedding"] * self.speaker_strength
 
-        # Support both legacy 'embedding' and new 'embedding_raw'
-        if 'embedding_raw' in ref_dict and torch.is_tensor(ref_dict['embedding_raw']):
-            scaled = ref_dict['embedding_raw'] * float(self.speaker_strength)
-            ref_dict['embedding'] = scaled
-        elif 'embedding' in ref_dict and torch.is_tensor(ref_dict['embedding']):
-            # If only embedding available we assume it's raw and scale in-place (non-destructive clone)
-            ref_dict['embedding'] = ref_dict['embedding'] * float(self.speaker_strength)
+        # Sanitize unexpected keys (e.g., legacy 'embedding_raw') to avoid passing unsupported kwargs
+        allowed = {"prompt_token", "prompt_token_len", "prompt_feat", "prompt_feat_len", "embedding"}
+        ref_dict = {k: v for k, v in ref_dict.items() if k in allowed}
 
         if len(speech_tokens.shape) == 1:
             speech_tokens = speech_tokens.unsqueeze(0)
@@ -343,27 +345,3 @@ class S3Token2Wav(S3Token2Mel):
     def set_speaker_strength(self, value: float):
         self.speaker_strength = float(value)
         return self
-
-    # ---- Debug / Introspection Helpers ----
-    def inspect_reference(self, ref_dict: dict | None = None):
-        """Return basic statistics of current (or provided) reference embedding for debugging.
-
-        Args:
-            ref_dict: Optional explicit reference dict (defaults to internal provided during forward call).
-        Returns:
-            dict with keys: norm_raw, norm_scaled, strength, cfg_rate
-        """
-        info = {
-            'strength': float(self.speaker_strength),
-            'cfg_rate': float(getattr(self, '_inference_cfg_rate', -1.0)),
-        }
-        try:
-            rd = ref_dict if ref_dict is not None else None
-            if rd is not None:
-                raw = rd.get('embedding_raw') or rd.get('embedding')
-                if torch.is_tensor(raw):
-                    info['norm_raw'] = float(raw.norm().item())
-                    info['norm_scaled'] = float((raw * self.speaker_strength).norm().item())
-        except Exception:
-            pass
-        return info
