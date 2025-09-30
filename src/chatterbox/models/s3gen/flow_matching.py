@@ -144,6 +144,15 @@ class ConditionalCFM(BASECFM):
             else:
                 cfg_rate = self.inference_cfg_rate
             dphi_dt = ((1.0 + cfg_rate) * dphi_dt - cfg_rate * cfg_dphi_dt)
+            if getattr(self, '_debug', False) and step == 1:
+                with torch.no_grad():
+                    diff = (dphi_dt - cfg_dphi_dt)
+                    try:
+                        active_scale = scale if 'scale' in locals() else 1.0
+                    except Exception:
+                        active_scale = 1.0
+                    print(f"[DEBUG][solve_euler] step={step} cfg_rate={cfg_rate} spk_scale={active_scale} "
+                          f"cond_norm={dphi_dt.norm().item():.4f} uncond_norm={cfg_dphi_dt.norm().item():.4f} diff_norm={diff.norm().item():.4f}")
             x = x + dt * dphi_dt
             t = t + dt
             sol.append(x)

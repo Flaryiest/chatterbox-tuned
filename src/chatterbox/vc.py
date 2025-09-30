@@ -223,11 +223,18 @@ class ChatterboxVC:
         speaker_ramp: bool | None = None,
         speaker_ramp_start: float = 0.6,
         ramp_shape: str = "sigmoid",
+        # Multi-segment & style modulation options
+        multi_ref_paths: list[str] | None = None,
+        multi_ref_mode: str = "mean",
+        multi_ref_robust: bool = True,
+        adain: bool = False,
     ):
-        if target_voice_path:
+        if multi_ref_paths:
+            self.set_target_voices(multi_ref_paths, mode=multi_ref_mode, robust=multi_ref_robust)
+        elif target_voice_path:
             self.set_target_voice(target_voice_path)
-        if target_voice_path is None:
-            assert self.ref_dict is not None, "Please `prepare_conditionals` first or specify `target_voice_path`"
+        if self.ref_dict is None:
+            raise ValueError("No target reference conditioning available. Provide target_voice_path or multi_ref_paths.")
 
         # Allow per-call overrides
         if speaker_strength is not None and hasattr(self.s3gen, 'set_speaker_strength'):
@@ -319,6 +326,9 @@ class ChatterboxVC:
                 if hasattr(self.s3gen, 'set_speaker_scale_schedule'):
                     self.s3gen.set_speaker_scale_schedule(None)
             # Now run inference with schedules applied
+            # Enable/disable AdaIN as requested
+            if hasattr(self.s3gen, 'set_adain_enabled'):
+                self.s3gen.set_adain_enabled(adain)
             wav, _ = self.s3gen.inference(
                 speech_tokens=s3_tokens,
                 ref_dict=self.ref_dict,

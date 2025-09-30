@@ -174,9 +174,19 @@ class S3Token2Mel(torch.nn.Module):
             prompt_feat_len=ref_mels_24_len,
             embedding=ref_x_vector,
         )
-        # apply speaker strength immediately so downstream code doesn't need to remember
+        # Apply speaker strength immediately so downstream code doesn't need to remember.
+        # NOTE: This will be applied *again* later in forward() if a pre-computed ref_dict is passed.
+        # We leave current behaviour intact (potential double scaling) but expose debug logging so
+        # users can inspect effective norms and decide whether to refactor.
         if self.speaker_strength != 1.0:
+            if getattr(self, '_debug', False):
+                with torch.no_grad():
+                    raw_norm = ref_dict["embedding"].norm().item()
             ref_dict["embedding"] = ref_dict["embedding"] * self.speaker_strength
+            if getattr(self, '_debug', False):
+                with torch.no_grad():
+                    new_norm = ref_dict["embedding"].norm().item()
+                print(f"[DEBUG][embed_ref] speaker_strength={self.speaker_strength:.3f} raw_norm={raw_norm:.4f} scaled_norm={new_norm:.4f}")
         return ref_dict
 
     def forward(
@@ -333,17 +343,29 @@ class S3Token2Wav(S3Token2Mel):
 
         NOTE: This mutates the underlying decoder's config so subsequent calls use the new value.
         """
-        self._inference_cfg_rate = float(value)
-        # Navigate into flow -> decoder -> cfm params if present
-        if hasattr(self, 'flow') and hasattr(self.flow, 'decoder') and hasattr(self.flow.decoder, 'cfm_params'):
+        v = float(value)
+        self._inference_cfg_rate = v
+        if hasattr(self, 'flow') and hasattr(self.flow, 'decoder'):
+            dec = self.flow.decoder
+            # Update live attribute actually read inside solve_euler
             try:
-                self.flow.decoder.cfm_params.inference_cfg_rate = float(value)
+                dec.inference_cfg_rate = v
             except Exception:
                 pass
+            # Keep cfm_params in sync (for serialization / inspection)
+            if hasattr(dec, 'cfm_params'):
+                try:
+                    dec.cfm_params.inference_cfg_rate = v
+                except Exception:
+                    pass
+            if getattr(self, '_debug', False):
+                print(f"[DEBUG][set_inference_cfg_rate] Updated inference_cfg_rate -> {v}")
         return self
 
     def set_speaker_strength(self, value: float):
         self.speaker_strength = float(value)
+        if getattr(self, '_debug', False):
+            print(f"[DEBUG][set_speaker_strength] speaker_strength -> {self.speaker_strength}")
         return self
 
     # -------- Scheduling helpers (optional inference tricks) --------
@@ -373,4 +395,20 @@ class S3Token2Wav(S3Token2Mel):
         sched = [float(x) for x in schedule]
         if hasattr(self.flow, 'decoder'):
             setattr(self.flow.decoder, '_spk_scale_schedule', sched)
+        if getattr(self, '_debug', False):
+            print(f"[DEBUG][set_speaker_scale_schedule] schedule={sched}")
+        return self
+
+    # -------- Debug helpers --------
+    def set_debug(self, enabled: bool = True):
+        """Enable or disable lightweight debug logging for inference-time parameter application.
+
+        When enabled, the flow solver will print the active cfg_rate, speaker scale (if scheduled),
+        and guidance difference norms for the first Euler step. Embedding norm scaling is also
+        reported in `embed_ref`.
+        """
+        setattr(self, '_debug', bool(enabled))
+        if hasattr(self, 'flow') and hasattr(self.flow, 'decoder'):
+            setattr(self.flow.decoder, '_debug', bool(enabled))
+        print(f"[DEBUG] Debug mode {'ENABLED' if enabled else 'DISABLED'}")
         return self
