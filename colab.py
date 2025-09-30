@@ -24,13 +24,30 @@ from chatterbox.models.voice_encoder import VoiceEncoder
 SOURCE_AUDIO = "/content/TaylorSwiftShort.wav"  # Active source
 TARGET_VOICE_PATH = "/content/Barack Obama.mp3"  # Single target reference
 
-FLOW_CFG_RATE = 0.90        # Strong style guidance (try 0.82–0.88 first if artifacts)
-SPEAKER_STRENGTH = 1.25     # Embedding scaling (1.15–1.30 typical)
-PRUNE_TOKENS = 0            # Try 4–8 to reduce source leakage
-ENABLE_PITCH_MATCH = True   # Use pitch matching hook
-PITCH_TOLERANCE = 0.4       # Ignore tiny shifts (semitones)
-MAX_PITCH_SHIFT = 6.0       # Clamp extreme shifts
-RUN_VARIANT_SWEEP = False   # Set True to automatically evaluate a small grid
+FLOW_CFG_RATE =  0.70       # Strong style guidance (try 0.82–0.88 first if artifacts)
+SPEAKER_STRENGTH = 1.1     # Embedding scaling (1.15–1.30 typical)
+PRUNE_TOKENS = 0            # 4–8 to reduce source leakage
+ENABLE_PITCH_MATCH = True  # Use pitch matching hook
+PITCH_TOLERANCE = 0.6      # Ignore tiny shifts (semitones)
+MAX_PITCH_SHIFT = 2.0       # Clamp extreme shifts
+RUN_VARIANT_SWEEP = False  # Set True to automatically evaluate a small grid
+# Enable large grid sweep (set True to run after primary example). This supersedes RUN_VARIANT_SWEEP.
+RUN_LARGE_GRID = False
+
+# Large grid configuration (no prune tokens as requested)
+GRID_FLOW_CFG_RATES_BASE = [0.0, 0.5, 0.8, 1.2, 1.6, 2.0, 2.5]
+GRID_SPEAKER_STRENGTHS_BASE = [1.0, 1.2, 1.3, 1.4, 1.5]
+# Subset for ramped refinement (picked from mid & upper region)
+GRID_FLOW_CFG_RATES_RAMP = [0.8, 1.2, 1.6, 2.0]
+GRID_SPEAKER_STRENGTHS_RAMP = [1.2, 1.3, 1.4]
+GUIDANCE_RAMP_MIN_VALUES = [0.25, 0.4]
+
+EXPORT_BASE_CSV = "/content/grid_base.csv"
+EXPORT_RAMP_CSV = "/content/grid_ramp.csv"
+EXPORT_JSON = "/content/grid_all.json"
+
+MAX_BASE_RUNS = None  # set an int to early stop the base grid (debug)
+MAX_RAMP_RUNS = None  # set an int to early stop the ramp grid
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -181,3 +198,201 @@ if RUN_VARIANT_SWEEP:
     print("\n[Variant Sweep]")
     for r in rows:
         print(r)
+
+# ---------------- Large Grid Sweep (No prune tokens) ----------------
+"""Large grid exploration.
+
+Two-stage approach:
+1. Base grid without ramps.
+2. Ramped refinement on a subset of (cfg, speaker_strength) pairs drawn from the higher-performing region.
+
+Metrics captured per run:
+ - cfg_rate, speaker_strength
+ - guidance_ramp (bool), speaker_ramp (bool)
+ - guidance_ramp_min (if used)
+ - cos_out_tgt, cos_out_src, identity_gain
+ - l2_out_tgt, l2_out_src, l2_advantage
+ - partial_gain
+ - runtime_sec
+ - applied_pitch_shift (if pitch matching active)
+
+Adjust the *_BASE / *_RAMP lists above to tune coverage. No prune token variation per request.
+Set RUN_LARGE_GRID=True to execute.
+"""
+
+import json
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Iterable, Tuple
+
+@dataclass
+class RunResult:
+    cfg_rate: float
+    speaker_strength: float
+    guidance_ramp: bool
+    speaker_ramp: bool
+    guidance_ramp_min: float | None
+    cos_out_tgt: float
+    cos_out_src: float
+    identity_gain: float
+    l2_out_tgt: float
+    l2_out_src: float
+    l2_advantage: float
+    partial_gain: float
+    runtime_sec: float
+    applied_pitch_shift: float | None
+
+def _eval_single(cfg_rate: float,
+                 speaker_strength: float,
+                 guidance_ramp: bool,
+                 speaker_ramp: bool,
+                 guidance_ramp_min: float | None,
+                 tag: str = "") -> RunResult:
+    start = time.time()
+    wav_local = model.generate(
+        audio=SOURCE_AUDIO,
+        target_voice_path=TARGET_VOICE_PATH,
+        flow_cfg_rate=cfg_rate,
+        speaker_strength=speaker_strength,
+        prune_tokens=0,
+        pitch_match=ENABLE_PITCH_MATCH,
+        pitch_tolerance=PITCH_TOLERANCE,
+        max_pitch_shift=MAX_PITCH_SHIFT,
+        guidance_ramp=guidance_ramp,
+        guidance_ramp_min=guidance_ramp_min if guidance_ramp else None,
+        guidance_ramp_max=None,
+        speaker_ramp=speaker_ramp,
+        speaker_ramp_start=0.6,
+        ramp_shape="sigmoid",
+    )
+    runtime = time.time() - start
+    # Write temp file (optional listening) - can be skipped for speed
+    out_tmp = f"/content/tmp_grid_{tag or 'x'}.wav"
+    try:
+        sf.write(out_tmp, wav_local.squeeze(0).cpu().numpy(), model.sr)
+    except Exception:
+        pass
+    out_spk_v, out_part_v = load_embeds_utterance(out_tmp, voice_encoder)
+    cos_tgt = cosine(out_spk_v, target_spk)
+    cos_src = cosine(out_spk_v, source_spk)
+    id_gain = cos_tgt - cos_src
+    l2_tgt = l2(out_spk_v, target_spk)
+    l2_src = l2(out_spk_v, source_spk)
+    p_gain = (mean_pairwise_cos(out_part_v, target_partials) -
+              mean_pairwise_cos(out_part_v, source_partials))
+    l2_adv = l2_src - l2_tgt
+    pitch_shift = model.get_last_pitch_shift() if hasattr(model, 'get_last_pitch_shift') else None
+    return RunResult(
+        cfg_rate=cfg_rate,
+        speaker_strength=speaker_strength,
+        guidance_ramp=guidance_ramp,
+        speaker_ramp=speaker_ramp,
+        guidance_ramp_min=guidance_ramp_min if guidance_ramp else None,
+        cos_out_tgt=cos_tgt,
+        cos_out_src=cos_src,
+        identity_gain=id_gain,
+        l2_out_tgt=l2_tgt,
+        l2_out_src=l2_src,
+        l2_advantage=l2_adv,
+        partial_gain=p_gain,
+        runtime_sec=runtime,
+        applied_pitch_shift=pitch_shift,
+    )
+
+def _build_base_pairs():
+    for cfg in GRID_FLOW_CFG_RATES_BASE:
+        for strength in GRID_SPEAKER_STRENGTHS_BASE:
+            yield cfg, strength
+
+def _build_ramp_pairs():
+    for cfg in GRID_FLOW_CFG_RATES_RAMP:
+        for strength in GRID_SPEAKER_STRENGTHS_RAMP:
+            for ramp_min in GUIDANCE_RAMP_MIN_VALUES:
+                # Evaluate combinations: ramp only, ramp+speaker_ramp, and (optionally) speaker_ramp only skipped to limit size
+                yield cfg, strength, ramp_min, True, False   # guidance ramp only
+                yield cfg, strength, ramp_min, True, True    # both ramps
+
+def _select_promising(base_results: List[RunResult], top_k: int = 10) -> List[Tuple[float, float]]:
+    # Score by identity_gain primary, l2_out_tgt secondary
+    scored = sorted(base_results, key=lambda r: (r.identity_gain, -r.l2_out_tgt), reverse=True)
+    picked = []
+    seen = set()
+    for r in scored:
+        key = (r.cfg_rate, r.speaker_strength)
+        if key in seen:
+            continue
+        picked.append(key)
+        seen.add(key)
+        if len(picked) >= top_k:
+            break
+    return picked
+
+def _filter_ramp_pairs(promising_keys: List[Tuple[float, float]]):
+    prom_set = set(promising_keys)
+    for cfg, strength, ramp_min, g_ramp, s_ramp in _build_ramp_pairs():
+        if (cfg, strength) in prom_set:
+            yield cfg, strength, ramp_min, g_ramp, s_ramp
+
+def _export_csv(path: str, rows: List[RunResult]):
+    import csv
+    fieldnames = list(asdict(rows[0]).keys()) if rows else []
+    with open(path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(asdict(r))
+    print(f"[GRID] Wrote {len(rows)} rows -> {path}")
+
+def _export_json(path: str, base_rows: List[RunResult], ramp_rows: List[RunResult]):
+    payload = {
+        'base': [asdict(r) for r in base_rows],
+        'ramp': [asdict(r) for r in ramp_rows],
+    }
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    print(f"[GRID] Wrote JSON -> {path}")
+
+if RUN_LARGE_GRID:
+    print("[GRID] Starting base grid sweep (no ramps)...")
+    base_results: List[RunResult] = []
+    for i, (cfg, strength) in enumerate(_build_base_pairs()):
+        if MAX_BASE_RUNS is not None and i >= MAX_BASE_RUNS:
+            print("[GRID] Early stop base grid due to MAX_BASE_RUNS")
+            break
+        res = _eval_single(cfg, strength, guidance_ramp=False, speaker_ramp=False, guidance_ramp_min=None, tag=f"b{i}")
+        base_results.append(res)
+        if (i + 1) % 10 == 0:
+            print(f"[GRID][BASE] Completed {i+1} runs")
+    if base_results:
+        _export_csv(EXPORT_BASE_CSV, base_results)
+    else:
+        print("[GRID] No base results produced (empty grid?)")
+
+    print("[GRID] Selecting promising pairs for ramp refinement...")
+    promising = _select_promising(base_results, top_k=10)
+    print(f"[GRID] Promising pairs: {promising}")
+
+    print("[GRID] Starting ramp refinement sweep...")
+    ramp_results: List[RunResult] = []
+    for j, (cfg, strength, ramp_min, g_ramp, s_ramp) in enumerate(_filter_ramp_pairs(promising)):
+        if MAX_RAMP_RUNS is not None and j >= MAX_RAMP_RUNS:
+            print("[GRID] Early stop ramp grid due to MAX_RAMP_RUNS")
+            break
+        res = _eval_single(cfg, strength, guidance_ramp=g_ramp, speaker_ramp=s_ramp, guidance_ramp_min=ramp_min, tag=f"r{j}")
+        ramp_results.append(res)
+        if (j + 1) % 10 == 0:
+            print(f"[GRID][RAMP] Completed {j+1} runs")
+    if ramp_results:
+        _export_csv(EXPORT_RAMP_CSV, ramp_results)
+    else:
+        print("[GRID] No ramp results produced (empty refinement set?)")
+
+    if base_results or ramp_results:
+        _export_json(EXPORT_JSON, base_results, ramp_results)
+
+    # Print top 5 combined by identity_gain
+    combined = base_results + ramp_results
+    combined_sorted = sorted(combined, key=lambda r: (r.identity_gain, -r.l2_out_tgt), reverse=True)
+    print("\n[GRID] Top 5 configurations:")
+    for rr in combined_sorted[:5]:
+        print(asdict(rr))
+
