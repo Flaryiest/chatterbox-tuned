@@ -396,3 +396,76 @@ if RUN_LARGE_GRID:
     for rr in combined_sorted[:5]:
         print(asdict(rr))
 
+# ---------------- Parameter Verification Utility ----------------
+"""Manual verification helper: run a miniature sweep over cfg_rate and speaker_strength
+and confirm that:
+ 1. The internal flow trace reflects the requested cfg_rate (or schedule values).
+ 2. Increasing cfg_rate or speaker_strength increases early-step diff_norm (up to saturation).
+
+Set RUN_VERIFY_PARAMS=True to execute. Adjust VERIFY_CFGS / VERIFY_STRENGTHS below.
+"""
+
+RUN_VERIFY_PARAMS = False
+VERIFY_CFGS = [0.0, 0.8, 1.6, 2.5]
+VERIFY_STRENGTHS = [1.0, 1.2, 1.4]
+VERIFY_SOURCE = SOURCE_AUDIO
+VERIFY_TARGET = TARGET_VOICE_PATH
+
+def verify_parameters(model, cfg_values, strength_values):
+    print("[VERIFY] Enabling trace...")
+    model.s3gen.enable_param_trace(True)
+    rows = []
+    for cfg in cfg_values:
+        model.s3gen.set_inference_cfg_rate(cfg)
+        for strength in strength_values:
+            model.s3gen.set_speaker_strength(strength)
+            wav_v = model.generate(
+                audio=VERIFY_SOURCE,
+                target_voice_path=VERIFY_TARGET,
+                flow_cfg_rate=cfg,
+                speaker_strength=strength,
+                prune_tokens=0,
+                pitch_match=ENABLE_PITCH_MATCH,
+                pitch_tolerance=PITCH_TOLERANCE,
+                max_pitch_shift=MAX_PITCH_SHIFT,
+            )
+            trace = model.s3gen.get_last_flow_trace() or []
+            if trace:
+                first = trace[0]
+                avg_diff = sum(t['diff_norm'] for t in trace) / len(trace)
+                rows.append({
+                    'cfg_rate': cfg,
+                    'speaker_strength': strength,
+                    'first_step_cfg_rate': first['cfg_rate'],
+                    'first_step_diff_norm': first['diff_norm'],
+                    'avg_diff_norm': avg_diff,
+                })
+            else:
+                rows.append({
+                    'cfg_rate': cfg,
+                    'speaker_strength': strength,
+                    'first_step_cfg_rate': None,
+                    'first_step_diff_norm': None,
+                    'avg_diff_norm': None,
+                })
+    # Basic monotonicity checks
+    print("\n[VERIFY] Results:")
+    for r in rows:
+        print(r)
+    # Group by speaker strength to see diff_norm vs cfg
+    print("\n[VERIFY] Monotonicity by speaker strength:")
+    from collections import defaultdict
+    by_strength = defaultdict(list)
+    for r in rows:
+        by_strength[r['speaker_strength']].append(r)
+    for strength, lst in by_strength.items():
+        lst_sorted = sorted(lst, key=lambda x: x['cfg_rate'])
+        diffs = [x['first_step_diff_norm'] for x in lst_sorted if x['first_step_diff_norm'] is not None]
+        trend = 'increasing' if all(diffs[i] <= diffs[i+1] for i in range(len(diffs)-1)) else 'non-monotonic'
+        print(f" speaker_strength={strength}: first_step_diff_norm sequence={diffs} -> {trend}")
+    model.s3gen.enable_param_trace(False)
+    return rows
+
+if RUN_VERIFY_PARAMS:
+    verify_parameters(model, VERIFY_CFGS, VERIFY_STRENGTHS)
+

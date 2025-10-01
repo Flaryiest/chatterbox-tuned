@@ -153,6 +153,19 @@ class ConditionalCFM(BASECFM):
                         active_scale = 1.0
                     print(f"[DEBUG][solve_euler] step={step} cfg_rate={cfg_rate} spk_scale={active_scale} "
                           f"cond_norm={dphi_dt.norm().item():.4f} uncond_norm={cfg_dphi_dt.norm().item():.4f} diff_norm={diff.norm().item():.4f}")
+            # Collect trace if enabled
+            if hasattr(self, '_trace') and self._trace:
+                if not hasattr(self, '_last_trace'):
+                    self._last_trace = []
+                with torch.no_grad():
+                    self._last_trace.append({
+                        'step': step,
+                        'cfg_rate': float(cfg_rate),
+                        'spk_scale': float(scale) if 'scale' in locals() else 1.0,
+                        'cond_norm': float(dphi_dt.norm().item()),
+                        'uncond_norm': float(cfg_dphi_dt.norm().item()),
+                        'diff_norm': float((dphi_dt - cfg_dphi_dt).norm().item()),
+                    })
             x = x + dt * dphi_dt
             t = t + dt
             sol.append(x)
