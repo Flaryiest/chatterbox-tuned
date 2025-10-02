@@ -35,11 +35,14 @@ class ChatterboxVC:
         enable_postprocessing: bool = True,
         preprocessing_strength: float = 0.7,
         postprocessing_strength: float = 0.8,
+        debug: bool = False,
     ):
         self.sr = S3GEN_SR
         self.s3gen = s3gen
         self.device = device
         self.watermarker = perth.PerthImplicitWatermarker()
+        self.debug = debug
+        
         # Pitch / prosody caches
         self._target_median_f0 = None
         self._enable_pitch_cache = enable_pitch_cache
@@ -50,8 +53,11 @@ class ChatterboxVC:
         self.enable_postprocessing = enable_postprocessing
         self.preprocessing_strength = preprocessing_strength
         self.postprocessing_strength = postprocessing_strength
-        self.audio_processor = AudioProcessor(sr=S3_SR)
+        self.audio_processor = AudioProcessor(sr=S3_SR, debug=debug)
         self._target_ref_wav = None  # Store target reference for post-processing
+        
+        if self.debug:
+            print(f"[ChatterboxVC][DEBUG] Initialized with preprocessing={enable_preprocessing}, postprocessing={enable_postprocessing}")
         # configure runtime knobs if supported by underlying model
         if hasattr(self.s3gen, 'set_inference_cfg_rate'):
             self.s3gen.set_inference_cfg_rate(flow_cfg_rate)
@@ -67,7 +73,20 @@ class ChatterboxVC:
             }
 
     @classmethod
-    def from_local(cls, ckpt_dir, device, *, flow_cfg_rate: float = 0.7, speaker_strength: float = 1.0, prune_tokens: int = 0) -> 'ChatterboxVC':
+    def from_local(
+        cls, 
+        ckpt_dir, 
+        device, 
+        *, 
+        flow_cfg_rate: float = 0.7, 
+        speaker_strength: float = 1.0, 
+        prune_tokens: int = 0,
+        enable_preprocessing: bool = True,
+        enable_postprocessing: bool = True,
+        preprocessing_strength: float = 0.7,
+        postprocessing_strength: float = 0.8,
+        debug: bool = False,
+    ) -> 'ChatterboxVC':
         ckpt_dir = Path(ckpt_dir)
         
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
@@ -95,10 +114,27 @@ class ChatterboxVC:
             flow_cfg_rate=flow_cfg_rate,
             speaker_strength=speaker_strength,
             prune_tokens=prune_tokens,
+            enable_preprocessing=enable_preprocessing,
+            enable_postprocessing=enable_postprocessing,
+            preprocessing_strength=preprocessing_strength,
+            postprocessing_strength=postprocessing_strength,
+            debug=debug,
         )
 
     @classmethod
-    def from_pretrained(cls, device, *, flow_cfg_rate: float = 0.7, speaker_strength: float = 1.0, prune_tokens: int = 0) -> 'ChatterboxVC':
+    def from_pretrained(
+        cls, 
+        device, 
+        *, 
+        flow_cfg_rate: float = 0.7, 
+        speaker_strength: float = 1.0, 
+        prune_tokens: int = 0,
+        enable_preprocessing: bool = True,
+        enable_postprocessing: bool = True,
+        preprocessing_strength: float = 0.7,
+        postprocessing_strength: float = 0.8,
+        debug: bool = False,
+    ) -> 'ChatterboxVC':
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -115,6 +151,11 @@ class ChatterboxVC:
             flow_cfg_rate=flow_cfg_rate,
             speaker_strength=speaker_strength,
             prune_tokens=prune_tokens,
+            enable_preprocessing=enable_preprocessing,
+            enable_postprocessing=enable_postprocessing,
+            preprocessing_strength=preprocessing_strength,
+            postprocessing_strength=postprocessing_strength,
+            debug=debug,
         )
 
     def set_target_voice(self, wav_fpath):
@@ -246,6 +287,12 @@ class ChatterboxVC:
         preprocessing_strength: float = None,
         postprocessing_strength: float = None,
     ):
+        from datetime import datetime
+        gen_start_time = datetime.now()
+        
+        if self.debug:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}][ChatterboxVC] === Starting Voice Conversion ===")
+        
         if target_voice_path:
             self.set_target_voice(target_voice_path)
         if target_voice_path is None:
@@ -254,8 +301,12 @@ class ChatterboxVC:
         # Allow per-call overrides
         if speaker_strength is not None and hasattr(self.s3gen, 'set_speaker_strength'):
             self.s3gen.set_speaker_strength(speaker_strength)
+            if self.debug:
+                print(f"[ChatterboxVC][DEBUG] Override speaker_strength={speaker_strength}")
         if flow_cfg_rate is not None and hasattr(self.s3gen, 'set_inference_cfg_rate'):
             self.s3gen.set_inference_cfg_rate(flow_cfg_rate)
+            if self.debug:
+                print(f"[ChatterboxVC][DEBUG] Override flow_cfg_rate={flow_cfg_rate}")
         if prune_tokens is not None:
             active_prune = int(prune_tokens)
         else:
@@ -266,18 +317,29 @@ class ChatterboxVC:
         use_postprocessing = enable_postprocessing if enable_postprocessing is not None else self.enable_postprocessing
         pre_strength = preprocessing_strength if preprocessing_strength is not None else self.preprocessing_strength
         post_strength = postprocessing_strength if postprocessing_strength is not None else self.postprocessing_strength
+        
+        if self.debug:
+            print(f"[ChatterboxVC][DEBUG] Config: pre={use_preprocessing}({pre_strength:.2f}), post={use_postprocessing}({post_strength:.2f}), prune={active_prune}")
 
         with torch.inference_mode():
+            load_start = datetime.now()
             audio_16, _ = librosa.load(audio, sr=S3_SR)
+            if self.debug:
+                load_time = (datetime.now() - load_start).total_seconds()
+                print(f"[ChatterboxVC][DEBUG] Audio loaded: {len(audio_16)/S3_SR:.2f}s duration, load_time={load_time:.3f}s")
             
             # ========== PRE-PROCESSING ==========
             if use_preprocessing:
-                print(f"[VC] Applying pre-processing (strength={pre_strength:.2f})...")
+                if not self.debug:
+                    print(f"[VC] Applying pre-processing (strength={pre_strength:.2f})...")
                 audio_16 = self.audio_processor.preprocess_source(
                     audio_16, 
                     target_median_f0=self._target_median_f0,
                     aggressiveness=pre_strength
                 )
+            else:
+                if self.debug:
+                    print(f"[ChatterboxVC][DEBUG] Pre-processing DISABLED")
             
             audio_16 = torch.from_numpy(audio_16).float().to(self.device)[None, ]
 
@@ -316,8 +378,14 @@ class ChatterboxVC:
                 self._last_pitch_shift_semitones = None
 
             s3_tokens, _ = self.s3gen.tokenizer(audio_16)
+            original_token_count = s3_tokens.size(1)
             if active_prune > 0 and s3_tokens.size(1) > active_prune:
                 s3_tokens = s3_tokens[:, active_prune:]
+                if self.debug:
+                    print(f"[ChatterboxVC][DEBUG] Pruned tokens: {original_token_count} -> {s3_tokens.size(1)} (removed {active_prune})")
+            elif self.debug:
+                print(f"[ChatterboxVC][DEBUG] Token count: {original_token_count} (no pruning)")
+                
             # -------- Optional scheduling (guidance & speaker scaling) --------
             # Number of internal flow steps is currently fixed at 10 (see flow_matching inference call n_timesteps)
             n_steps = 10
@@ -336,6 +404,8 @@ class ChatterboxVC:
                 else:
                     cfg_sched = torch.linspace(base_cfg, peak_cfg, n_steps).tolist()
                 self.s3gen.set_cfg_rate_schedule(cfg_sched)
+                if self.debug:
+                    print(f"[ChatterboxVC][DEBUG] Guidance ramp enabled: {base_cfg:.2f}->{peak_cfg:.2f}")
             else:
                 if hasattr(self.s3gen, 'set_cfg_rate_schedule'):
                     self.s3gen.set_cfg_rate_schedule(None)
@@ -353,19 +423,29 @@ class ChatterboxVC:
                 else:
                     scales = torch.linspace(start_strength, final_strength, n_steps) / max(final_strength, 1e-6)
                 self.s3gen.set_speaker_scale_schedule(scales.tolist())
+                if self.debug:
+                    print(f"[ChatterboxVC][DEBUG] Speaker ramp enabled: {start_strength:.2f}->{final_strength:.2f}")
             else:
                 if hasattr(self.s3gen, 'set_speaker_scale_schedule'):
                     self.s3gen.set_speaker_scale_schedule(None)
+                    
             # Now run inference with schedules applied
+            if self.debug:
+                print(f"[ChatterboxVC][DEBUG] Starting S3Gen inference...")
+            inference_start = datetime.now()
             wav, _ = self.s3gen.inference(
                 speech_tokens=s3_tokens,
                 ref_dict=self.ref_dict,
             )
+            inference_time = (datetime.now() - inference_start).total_seconds()
+            if self.debug:
+                print(f"[ChatterboxVC][DEBUG] S3Gen inference complete: {inference_time:.3f}s")
             wav = wav.squeeze(0).detach().cpu().numpy()
             
             # ========== POST-PROCESSING ==========
             if use_postprocessing and self._target_ref_wav is not None:
-                print(f"[VC] Applying post-processing (strength={post_strength:.2f})...")
+                if not self.debug:
+                    print(f"[VC] Applying post-processing (strength={post_strength:.2f})...")
                 # Resample output to 16kHz for post-processing
                 wav_16k = librosa.resample(wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
                 
@@ -378,8 +458,21 @@ class ChatterboxVC:
                 
                 # Resample back to 24kHz
                 wav = librosa.resample(wav_16k, orig_sr=S3_SR, target_sr=S3GEN_SR)
+            elif use_postprocessing and self._target_ref_wav is None:
+                if self.debug:
+                    print(f"[ChatterboxVC][WARNING] Post-processing enabled but no target reference cached, skipping")
+            else:
+                if self.debug:
+                    print(f"[ChatterboxVC][DEBUG] Post-processing DISABLED")
             
+            if self.debug:
+                print(f"[ChatterboxVC][DEBUG] Applying watermark...")
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            
+        total_time = (datetime.now() - gen_start_time).total_seconds()
+        if self.debug:
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}][ChatterboxVC] === Voice Conversion Complete: {total_time:.3f}s total ===\n")
+        
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
     def get_last_pitch_shift(self) -> float | None:

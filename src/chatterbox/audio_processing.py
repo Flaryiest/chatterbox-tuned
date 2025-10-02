@@ -9,15 +9,35 @@ import torch
 from scipy import signal
 from scipy.interpolate import interp1d
 import warnings
+import logging
+from datetime import datetime
 
 warnings.filterwarnings('ignore')
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+
+def _timestamp():
+    """Generate timestamp for logging."""
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
 class AudioProcessor:
     """Handles pre and post-processing for improved voice conversion."""
     
-    def __init__(self, sr=16000):
+    def __init__(self, sr=16000, debug=False):
         self.sr = sr
+        self.debug = debug
+        if self.debug:
+            logger.setLevel(logging.DEBUG)
+        
+    def _log(self, message, level="INFO"):
+        """Internal logging with timestamp."""
+        if self.debug or level in ["WARNING", "ERROR"]:
+            timestamp = _timestamp()
+            prefix = f"[{timestamp}][AudioProcessor][{level}]"
+            print(f"{prefix} {message}")
         
     # ==================== PRE-PROCESSING ====================
     
@@ -33,6 +53,9 @@ class AudioProcessor:
         Returns:
             Processed audio with reduced speaker identity
         """
+        start_time = datetime.now()
+        self._log(f"Starting pre-processing (aggressiveness={aggressiveness:.2f})", "INFO")
+        
         if isinstance(wav, torch.Tensor):
             wav = wav.cpu().numpy()
         
@@ -41,24 +64,40 @@ class AudioProcessor:
         
         # Ensure float32
         wav = wav.astype(np.float32)
+        original_length = len(wav)
+        original_rms = np.sqrt(np.mean(wav**2))
+        
+        self._log(f"Input: length={original_length} samples, RMS={original_rms:.4f}", "DEBUG")
         
         # 1. Spectral preemphasis (reduce low-freq speaker cues)
+        self._log("Step 1/5: Applying spectral preemphasis", "DEBUG")
         wav = self._apply_preemphasis(wav, coef=0.95 * aggressiveness)
         
         # 2. Pitch normalization toward neutral or target
         if target_median_f0 is not None:
+            self._log(f"Step 2/5: Normalizing pitch toward target F0={target_median_f0:.1f}Hz", "DEBUG")
             wav = self._normalize_pitch_toward_target(wav, target_median_f0, strength=aggressiveness)
         else:
+            self._log("Step 2/5: Normalizing pitch variance (no target F0)", "DEBUG")
             wav = self._normalize_pitch_variance(wav, strength=aggressiveness * 0.5)
         
         # 3. Spectral whitening (reduce timbre cues)
+        self._log(f"Step 3/5: Applying spectral whitening (strength={aggressiveness * 0.6:.2f})", "DEBUG")
         wav = self._spectral_whitening(wav, strength=aggressiveness * 0.6)
         
         # 4. Dynamics normalization
+        self._log("Step 4/5: Normalizing dynamics", "DEBUG")
         wav = self._normalize_dynamics(wav)
         
         # 5. Remove very low frequencies (< 80Hz) that carry speaker identity
+        self._log("Step 5/5: Applying high-pass filter (80Hz)", "DEBUG")
         wav = self._highpass_filter(wav, cutoff=80)
+        
+        # Final stats
+        final_rms = np.sqrt(np.mean(wav**2))
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        self._log(f"Pre-processing complete: duration={duration:.3f}s, RMS change={original_rms:.4f}->{final_rms:.4f}", "INFO")
         
         return wav
     
@@ -75,12 +114,14 @@ class AudioProcessor:
             f0 = self._extract_f0_robust(wav)
             
             if f0 is None or len(f0[~np.isnan(f0)]) < 10:
+                self._log("Pitch normalization skipped: F0 extraction failed", "WARNING")
                 return wav
             
             # Calculate median F0
             source_median_f0 = np.nanmedian(f0[f0 > 0])
             
             if source_median_f0 <= 0 or target_f0 <= 0:
+                self._log(f"Pitch normalization skipped: invalid F0 (source={source_median_f0:.1f}, target={target_f0:.1f})", "WARNING")
                 return wav
             
             # Calculate shift in semitones
@@ -93,7 +134,10 @@ class AudioProcessor:
             shift_semitones = np.clip(shift_semitones, -6, 6)
             
             if abs(shift_semitones) < 0.3:
+                self._log(f"Pitch shift too small ({shift_semitones:.2f} semitones), skipping", "DEBUG")
                 return wav
+            
+            self._log(f"Applying pitch shift: {shift_semitones:.2f} semitones (source={source_median_f0:.1f}Hz -> target={target_f0:.1f}Hz)", "DEBUG")
             
             # Apply pitch shift
             wav_shifted = librosa.effects.pitch_shift(
@@ -103,7 +147,7 @@ class AudioProcessor:
             return wav_shifted
             
         except Exception as e:
-            print(f"Warning: Pitch normalization failed: {e}")
+            self._log(f"Pitch normalization failed: {e}", "ERROR")
             return wav
     
     def _normalize_pitch_variance(self, wav, strength=0.5):
@@ -132,6 +176,9 @@ class AudioProcessor:
     def _spectral_whitening(self, wav, strength=0.6):
         """Apply spectral whitening to reduce timbre cues."""
         try:
+            if strength <= 0:
+                return wav
+                
             # Compute STFT
             D = librosa.stft(wav, n_fft=2048, hop_length=512)
             mag, phase = np.abs(D), np.angle(D)
@@ -158,7 +205,7 @@ class AudioProcessor:
             return wav_whitened.astype(np.float32)
             
         except Exception as e:
-            print(f"Warning: Spectral whitening failed: {e}")
+            self._log(f"Spectral whitening failed: {e}", "ERROR")
             return wav
     
     def _normalize_dynamics(self, wav):
@@ -204,6 +251,9 @@ class AudioProcessor:
         Returns:
             Enhanced audio closer to target speaker
         """
+        start_time = datetime.now()
+        self._log(f"Starting post-processing (aggressiveness={aggressiveness:.2f})", "INFO")
+        
         if isinstance(output_wav, torch.Tensor):
             output_wav = output_wav.cpu().numpy()
         if isinstance(target_ref_wav, torch.Tensor):
@@ -212,17 +262,37 @@ class AudioProcessor:
         output_wav = output_wav.squeeze().astype(np.float32)
         target_ref_wav = target_ref_wav.squeeze().astype(np.float32)
         
+        original_length = len(output_wav)
+        original_rms = np.sqrt(np.mean(output_wav**2))
+        
+        self._log(f"Input: output_length={original_length}, target_length={len(target_ref_wav)}, RMS={original_rms:.4f}", "DEBUG")
+        
         # Resample target to match output if needed
         if len(target_ref_wav) < self.sr:
             # Too short, repeat
             repeats = int(np.ceil(self.sr / len(target_ref_wav)))
             target_ref_wav = np.tile(target_ref_wav, repeats)[:self.sr * 3]
+            self._log(f"Target reference too short, repeated {repeats}x", "DEBUG")
         
         # 1. Prosody transplant (F0 and energy alignment)
+        self._log(f"Step 1/3: Aligning prosody (strength={aggressiveness * 0.6:.2f})", "DEBUG")
         output_wav = self._align_prosody_to_target(output_wav, target_ref_wav, strength=aggressiveness * 0.6)
         
         # 2. Formant shifting toward target
+        self._log(f"Step 2/3: Shifting formants (strength={aggressiveness * 0.8:.2f})", "DEBUG")
         output_wav = self._shift_formants_to_target(output_wav, target_ref_wav, strength=aggressiveness * 0.8)
+        
+        # 3. Spectral envelope matching
+        self._log(f"Step 3/3: Matching spectral envelope (strength={aggressiveness:.2f})", "DEBUG")
+        output_wav = self._match_spectral_envelope(output_wav, target_ref_wav, strength=aggressiveness)
+        
+        # Final stats
+        final_rms = np.sqrt(np.mean(output_wav**2))
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        self._log(f"Post-processing complete: duration={duration:.3f}s, RMS change={original_rms:.4f}->{final_rms:.4f}", "INFO")
+        
+        return output_wav
         
         # 3. Spectral envelope matching
         output_wav = self._match_spectral_envelope(output_wav, target_ref_wav, strength=aggressiveness)
@@ -240,6 +310,7 @@ class AudioProcessor:
             target_f0 = self._extract_f0_robust(target_wav)
             
             if output_f0 is None or target_f0 is None:
+                self._log("Prosody alignment skipped: F0 extraction failed", "WARNING")
                 return output_wav
             
             # Get median values
@@ -247,6 +318,7 @@ class AudioProcessor:
             target_median = np.nanmedian(target_f0[target_f0 > 0])
             
             if output_median <= 0 or target_median <= 0:
+                self._log(f"Prosody alignment skipped: invalid F0 (output={output_median:.1f}, target={target_median:.1f})", "WARNING")
                 return output_wav
             
             # Calculate shift to align medians
@@ -255,14 +327,17 @@ class AudioProcessor:
             shift_semitones = np.clip(shift_semitones, -4, 4)
             
             if abs(shift_semitones) > 0.3:
+                self._log(f"Applying prosody shift: {shift_semitones:.2f} semitones (output={output_median:.1f}Hz -> target={target_median:.1f}Hz)", "DEBUG")
                 output_wav = librosa.effects.pitch_shift(
                     output_wav, sr=self.sr, n_steps=shift_semitones, res_type='kaiser_best'
                 )
+            else:
+                self._log(f"Prosody shift too small ({shift_semitones:.2f} semitones), skipping", "DEBUG")
             
             return output_wav
             
         except Exception as e:
-            print(f"Warning: Prosody alignment failed: {e}")
+            self._log(f"Prosody alignment failed: {e}", "ERROR")
             return output_wav
     
     def _shift_formants_to_target(self, output_wav, target_wav, strength=0.8):
@@ -276,6 +351,7 @@ class AudioProcessor:
             target_lpc = self._extract_lpc_envelope(target_wav)
             
             if output_lpc is None or target_lpc is None:
+                self._log("Formant shifting skipped: LPC extraction failed", "WARNING")
                 return output_wav
             
             # Estimate formant shift via LPC coefficient warping
@@ -285,7 +361,10 @@ class AudioProcessor:
             alpha = np.clip(alpha, 0.85, 1.15)
             
             if abs(alpha - 1.0) < 0.02:
+                self._log(f"Formant warp factor too small (alpha={alpha:.3f}), skipping", "DEBUG")
                 return output_wav
+            
+            self._log(f"Applying formant warping: alpha={alpha:.3f}", "DEBUG")
             
             # Apply frequency warping
             output_wav = self._apply_frequency_warping(output_wav, alpha)
@@ -293,7 +372,7 @@ class AudioProcessor:
             return output_wav
             
         except Exception as e:
-            print(f"Warning: Formant shifting failed: {e}")
+            self._log(f"Formant shifting failed: {e}", "ERROR")
             return output_wav
     
     def _match_spectral_envelope(self, output_wav, target_wav, strength=0.8):
