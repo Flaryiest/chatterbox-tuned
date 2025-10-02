@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 from .models.s3tokenizer import S3_SR
 from .models.s3gen import S3GEN_SR, S3Gen
 from .audio_processing import AudioProcessor, extract_median_f0
+from .safe_audio_processing import SafeAudioProcessor
 
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -28,11 +29,11 @@ class ChatterboxVC:
         ref_dict: dict=None,
         *,
         flow_cfg_rate: float = 0.8,
-        speaker_strength: float = 1.0,
+        speaker_strength: float = 1.5,  # INCREASED: More target voice influence
         prune_tokens: int = 0,
         enable_pitch_cache: bool = True,
-        enable_preprocessing: bool = True,
-        enable_postprocessing: bool = True,
+        enable_preprocessing: bool = False,  # DISABLED: Too destructive
+        enable_postprocessing: bool = False,  # DISABLED: Causes artifacts
         preprocessing_strength: float = 0.7,
         postprocessing_strength: float = 0.8,
         debug: bool = False,
@@ -54,6 +55,7 @@ class ChatterboxVC:
         self.preprocessing_strength = preprocessing_strength
         self.postprocessing_strength = postprocessing_strength
         self.audio_processor = AudioProcessor(sr=S3_SR, debug=debug)
+        self.safe_processor = SafeAudioProcessor(sr=S3GEN_SR)  # Non-destructive processing
         self._target_ref_wav = None  # Store target reference for post-processing
         
         if self.debug:
@@ -79,10 +81,10 @@ class ChatterboxVC:
         device, 
         *, 
         flow_cfg_rate: float = 0.7, 
-        speaker_strength: float = 1.0, 
+        speaker_strength: float = 1.5,  # INCREASED for better target similarity
         prune_tokens: int = 0,
-        enable_preprocessing: bool = True,
-        enable_postprocessing: bool = True,
+        enable_preprocessing: bool = False,  # DISABLED by default
+        enable_postprocessing: bool = False,  # DISABLED by default
         preprocessing_strength: float = 0.7,
         postprocessing_strength: float = 0.8,
         debug: bool = False,
@@ -127,7 +129,7 @@ class ChatterboxVC:
         device, 
         *, 
         flow_cfg_rate: float = 0.7, 
-        speaker_strength: float = 1.0, 
+        speaker_strength: float = 1.5,  # INCREASED for better target similarity
         prune_tokens: int = 0,
         enable_preprocessing: bool = True,
         enable_postprocessing: bool = True,
@@ -442,22 +444,19 @@ class ChatterboxVC:
                 print(f"[ChatterboxVC][DEBUG] S3Gen inference complete: {inference_time:.3f}s")
             wav = wav.squeeze(0).detach().cpu().numpy()
             
-            # ========== POST-PROCESSING ==========
+            # ========== POST-PROCESSING (SAFE VERSION) ==========
             if use_postprocessing and self._target_ref_wav is not None:
-                if not self.debug:
-                    print(f"[VC] Applying post-processing (strength={post_strength:.2f})...")
-                # Resample output to 16kHz for post-processing
-                wav_16k = librosa.resample(wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+                if self.debug:
+                    print(f"[ChatterboxVC][DEBUG] Applying SAFE post-processing (strength={post_strength:.2f})...")
                 
-                # Apply post-processing
-                wav_16k = self.audio_processor.postprocess_output(
-                    wav_16k,
-                    self._target_ref_wav,
-                    aggressiveness=post_strength
-                )
+                # Resample target to match output SR
+                target_24k = librosa.resample(self._target_ref_wav, orig_sr=S3_SR, target_sr=S3GEN_SR)
                 
-                # Resample back to 24kHz
-                wav = librosa.resample(wav_16k, orig_sr=S3_SR, target_sr=S3GEN_SR)
+                # Apply gentle, artifact-free adjustments
+                wav = self.safe_processor.gentle_rms_match(wav, target_24k, strength=post_strength * 0.5)
+                
+                if self.debug:
+                    print(f"[ChatterboxVC][DEBUG] Safe post-processing complete (gentle RMS matching only)")
             elif use_postprocessing and self._target_ref_wav is None:
                 if self.debug:
                     print(f"[ChatterboxVC][WARNING] Post-processing enabled but no target reference cached, skipping")

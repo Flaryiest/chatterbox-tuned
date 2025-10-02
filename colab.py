@@ -24,19 +24,21 @@ from chatterbox.models.voice_encoder import VoiceEncoder
 SOURCE_AUDIO = "/content/TaylorSwiftShort.wav"  # Active source
 TARGET_VOICE_PATH = "/content/Barack Obama.mp3"  # Single target reference
 
-FLOW_CFG_RATE =  0.70       # Strong style guidance (try 0.82–0.88 first if artifacts)
-SPEAKER_STRENGTH = 1.1     # Embedding scaling (1.15–1.30 typical)
-PRUNE_TOKENS = 0            # 4–8 to reduce source leakage
-ENABLE_PITCH_MATCH = True  # Use pitch matching hook
-PITCH_TOLERANCE = 0.6      # Ignore tiny shifts (semitones)
+FLOW_CFG_RATE =  0.65       # Content/style balance (0.6-0.7 recommended)
+SPEAKER_STRENGTH = 1.8      # 🔥 KEY PARAMETER: Higher = more target voice (1.5-2.5 range)
+PRUNE_TOKENS = 8            # Slight quality improvement
+ENABLE_PITCH_MATCH = True   # Use pitch matching hook
+PITCH_TOLERANCE = 0.6       # Ignore tiny shifts (semitones)
 MAX_PITCH_SHIFT = 2.0       # Clamp extreme shifts
 
-# ========== NEW PROCESSING OPTIONS ==========
-ENABLE_PREPROCESSING = True      # Apply aggressive source neutralization
-PREPROCESSING_STRENGTH = 0.7     # 0.0-1.0, how much to remove source identity
-ENABLE_POSTPROCESSING = True     # Apply target speaker enhancement
-POSTPROCESSING_STRENGTH = 0.8    # 0.0-1.0, how strongly to push toward target
-# ============================================
+# ========== PROCESSING OPTIONS (FIXED) ==========
+# Pre-processing DISABLED: Caused word loss even at low strengths
+# Post-processing now SAFE: Only gentle RMS matching, no artifacts
+ENABLE_PREPROCESSING = False     # ❌ DISABLED: Too destructive
+PREPROCESSING_STRENGTH = 0.0     # Not used when disabled
+ENABLE_POSTPROCESSING = True     # ✅ SAFE: Gentle energy matching only
+POSTPROCESSING_STRENGTH = 0.4    # 0.3-0.5 recommended (safe range)
+# ================================================
 
 RUN_VARIANT_SWEEP = False  # Set True to automatically evaluate a small grid
 # Enable large grid sweep (set True to run after primary example). This supersedes RUN_VARIANT_SWEEP.

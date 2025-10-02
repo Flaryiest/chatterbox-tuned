@@ -26,6 +26,30 @@ If you like the model but need to scale or tune it for higher accuracy, check ou
 - Easy voice conversion script
 - [Outperforms ElevenLabs](https://podonos.com/resembleai/chatterbox)
 
+## ⚠️ IMPORTANT: Voice Conversion Users
+
+**Experiencing artifacts? Metallic sound? Lost words?** → See **[QUICK_FIX.md](QUICK_FIX.md)** for immediate solution!
+
+**TL;DR - Use these safe settings:**
+```python
+model = ChatterboxVC.from_pretrained(
+    enable_preprocessing=False,   # Critical: prevents word loss
+    enable_postprocessing=False   # Critical: prevents metallic artifacts
+)
+
+wav = model.generate(
+    audio="source.wav",
+    target_voice_path="target.wav",
+    token_prune_count=5,    # Safe range: 3-8
+    guidance_scale=1.5      # Safe range: 1.0-2.0
+)
+```
+
+📚 **Documentation for VC enhancement:**
+- [QUICK_FIX.md](QUICK_FIX.md) - Immediate action plan (start here!)
+- [SAFE_PROCESSING_GUIDE.md](SAFE_PROCESSING_GUIDE.md) - Comprehensive guide
+- [ROOT_CAUSE_ANALYSIS.md](ROOT_CAUSE_ANALYSIS.md) - Technical deep dive
+
 # Tips
 - **General Use (TTS and Voice Agents):**
   - The default settings (`exaggeration=0.5`, `cfg_weight=0.5`) work well for most prompts.
