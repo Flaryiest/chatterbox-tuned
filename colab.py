@@ -52,6 +52,7 @@ FAST_PREPROCESS = True                  # Use fast_mode (skips gate & stable win
 METRICS_USE_PREPROCESSED = True         # Whether metrics compare against preprocessed reference/source
 POST_SMOOTH_RASPINESS = True            # Apply light spectral smoothing after generation
 POST_SMOOTH_ALPHA = 0.15                # 0-1; higher = stronger smoothing
+FORCE_SLOW_PREPROCESS = False           # Override to run full (slow) pipeline even if FAST_PREPROCESS True
 
 # Output preprocessed artifact paths (kept separate to preserve original paths requested)
 PREPROCESSED_REFERENCE_PATH = "/content/target_reference_preproc.wav"
@@ -100,12 +101,22 @@ if ENABLE_PREPROCESS_REFERENCE or ENABLE_PREPROCESS_SOURCE:
     # 1. Reference preprocessing
     if ENABLE_PREPROCESS_REFERENCE:
         try:
-            ref_cfg = ReferencePreprocessConfig(fast_mode=FAST_PREPROCESS, apply_gate=not FAST_PREPROCESS, use_stable_window=not FAST_PREPROCESS)
+            effective_fast = FAST_PREPROCESS and not FORCE_SLOW_PREPROCESS
+            ref_cfg = ReferencePreprocessConfig(fast_mode=effective_fast, apply_gate=not effective_fast, use_stable_window=not effective_fast)
             ref_audio_24k, ref_info = preprocess_reference(TARGET_VOICE_PATH, ref_cfg, collect_timing=True)
             sf.write(PREPROCESSED_REFERENCE_PATH, ref_audio_24k, ref_info["sample_rate"])
             ref_used_path = PREPROCESSED_REFERENCE_PATH
             stage_times['ref_preprocess_sec'] = ref_info.get('total_sec', None)
-            ts(f"[PRE][REF] Saved preprocessed reference -> {ref_used_path} total={ref_info.get('total_sec')}s fast={FAST_PREPROCESS} timing={ref_info.get('timing', {})}")
+            # Stats / hash
+            import hashlib
+            def audio_stats(arr, sr):
+                return dict(duration_sec=len(arr)/sr, rms=float(np.sqrt(np.mean(arr**2)+1e-9)), peak=float(np.max(np.abs(arr))), centroid=float(librosa.feature.spectral_centroid(y=arr, sr=sr).mean()))
+            raw_ref, _ = librosa.load(TARGET_VOICE_PATH, sr=ref_info['sample_rate'], mono=True)
+            stats_raw = audio_stats(raw_ref, ref_info['sample_rate'])
+            stats_proc = audio_stats(ref_audio_24k, ref_info['sample_rate'])
+            md5_proc = hashlib.md5(ref_audio_24k.tobytes()).hexdigest()
+            diff_mean = float(np.mean(np.abs(raw_ref[:len(ref_audio_24k)] - ref_audio_24k)))
+            ts(f"[PRE][REF] Saved preprocessed reference -> {ref_used_path} total={ref_info.get('total_sec')}s fast={effective_fast} steps={ref_info.get('applied_steps')} timing={ref_info.get('timing', {})} md5={md5_proc} diff_mean={diff_mean:.6f} raw_stats={stats_raw} proc_stats={stats_proc}")
         except Exception as e:  # pragma: no cover
             ts(f"[PRE][REF][WARN] Failed preprocessing reference ({e}); falling back to raw file")
     # 2. Source preprocessing (needs reference downsampled)
@@ -117,7 +128,7 @@ if ENABLE_PREPROCESS_REFERENCE or ENABLE_PREPROCESS_SOURCE:
             else:
                 temp_ref = ref_audio_24k
             ref_16 = librosa.resample(temp_ref, orig_sr=24000, target_sr=16000)
-            src_result = preprocess_source(SOURCE_AUDIO, ref_16, source_sr=16000, fast_mode=FAST_PREPROCESS, collect_timing=True)
+            src_result = preprocess_source(SOURCE_AUDIO, ref_16, source_sr=16000, fast_mode=effective_fast, collect_timing=True)
             if isinstance(src_result, tuple):
                 src_neutral, src_info = src_result
                 stage_times['src_preprocess_sec'] = src_info.get('total_sec', None)
@@ -125,7 +136,15 @@ if ENABLE_PREPROCESS_REFERENCE or ENABLE_PREPROCESS_SOURCE:
                 src_neutral = src_result
             sf.write(PREPROCESSED_SOURCE_PATH, src_neutral, 16000)
             src_used_path = PREPROCESSED_SOURCE_PATH
-            ts(f"[PRE][SRC] Saved preprocessed source -> {src_used_path} fast={FAST_PREPROCESS} info={src_info if 'src_info' in locals() else {}}")
+            import hashlib
+            raw_src, _ = librosa.load(SOURCE_AUDIO, sr=16000, mono=True)
+            def src_stats(arr):
+                return dict(duration_sec=len(arr)/16000, rms=float(np.sqrt(np.mean(arr**2)+1e-9)), peak=float(np.max(np.abs(arr))))
+            stats_src_raw = src_stats(raw_src)
+            stats_src_proc = src_stats(src_neutral)
+            md5_src = hashlib.md5(src_neutral.tobytes()).hexdigest()
+            diff_src_mean = float(np.mean(np.abs(raw_src[:len(src_neutral)] - src_neutral)))
+            ts(f"[PRE][SRC] Saved preprocessed source -> {src_used_path} fast={effective_fast} info={src_info if 'src_info' in locals() else {}} md5={md5_src} diff_mean={diff_src_mean:.6f} raw_stats={stats_src_raw} proc_stats={stats_src_proc}")
         except Exception as e:  # pragma: no cover
             ts(f"[PRE][SRC][WARN] Failed preprocessing source ({e}); falling back to raw file")
 else:

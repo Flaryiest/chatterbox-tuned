@@ -178,18 +178,23 @@ class ReferencePreprocessConfig:
 
 def preprocess_reference(path: str, cfg: ReferencePreprocessConfig = ReferencePreprocessConfig(), *, collect_timing: bool = False) -> Tuple[np.ndarray, Dict[str, Any]]:
     t0 = time.time(); timing: Dict[str, float] = {}
-    y = load_and_trim(path, cfg.sr); timing['load_trim'] = time.time() - t0
+    applied = []
+    y = load_and_trim(path, cfg.sr); timing['load_trim'] = time.time() - t0; applied.append('load_trim')
     t1 = time.time(); y = loudness_normalize(y, cfg.sr, cfg.target_lufs); timing['loudness'] = time.time() - t1
+    applied.append('loudness')
     if cfg.fast_mode:
         # Skip gate & stable window for speed
         pass
     else:
         if cfg.apply_gate:
             t2 = time.time(); y = spectral_gate(y, cfg.sr); timing['spectral_gate'] = time.time() - t2
+            applied.append('spectral_gate')
         if cfg.use_stable_window:
             t3 = time.time(); y = pick_stable_window(y, cfg.sr, win_sec=cfg.stable_window_sec); timing['stable_window'] = time.time() - t3
+            applied.append('stable_window')
     if cfg.spectral_tilt:
         t4 = time.time(); y = spectral_tilt_normalize(y); timing['spectral_tilt'] = time.time() - t4
+        applied.append('spectral_tilt')
     band = bandlimit(y, cfg.sr)
     total = time.time() - t0
     info: Dict[str, Any] = {
@@ -197,6 +202,7 @@ def preprocess_reference(path: str, cfg: ReferencePreprocessConfig = ReferencePr
         "sample_rate": cfg.sr,
         "band_variant": band is not None,
         "total_sec": total,
+        "applied_steps": applied,
     }
     if collect_timing:
         info['timing'] = timing
