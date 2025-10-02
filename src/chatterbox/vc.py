@@ -11,6 +11,7 @@ from safetensors.torch import load_file
 
 from .models.s3tokenizer import S3_SR
 from .models.s3gen import S3GEN_SR, S3Gen
+from .audio_processing import AudioProcessor, extract_median_f0
 
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -30,6 +31,10 @@ class ChatterboxVC:
         speaker_strength: float = 1.0,
         prune_tokens: int = 0,
         enable_pitch_cache: bool = True,
+        enable_preprocessing: bool = True,
+        enable_postprocessing: bool = True,
+        preprocessing_strength: float = 0.7,
+        postprocessing_strength: float = 0.8,
     ):
         self.sr = S3GEN_SR
         self.s3gen = s3gen
@@ -40,6 +45,13 @@ class ChatterboxVC:
         self._enable_pitch_cache = enable_pitch_cache
         # Track last applied semitone pitch shift (None means no pitch matching attempted)
         self._last_pitch_shift_semitones = None  # type: float | None
+        # Audio processing
+        self.enable_preprocessing = enable_preprocessing
+        self.enable_postprocessing = enable_postprocessing
+        self.preprocessing_strength = preprocessing_strength
+        self.postprocessing_strength = postprocessing_strength
+        self.audio_processor = AudioProcessor(sr=S3_SR)
+        self._target_ref_wav = None  # Store target reference for post-processing
         # configure runtime knobs if supported by underlying model
         if hasattr(self.s3gen, 'set_inference_cfg_rate'):
             self.s3gen.set_inference_cfg_rate(flow_cfg_rate)
@@ -111,9 +123,15 @@ class ChatterboxVC:
 
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
         self.ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
-        # Cache target median F0 for later pitch matching
+        
+        # Cache target median F0 for later pitch matching and preprocessing
         if self._enable_pitch_cache:
             self._target_median_f0 = self._extract_median_f0(s3gen_ref_wav, S3GEN_SR)
+        
+        # Store target reference for post-processing (resample to 16kHz for post-processing)
+        if self.enable_postprocessing:
+            target_16k, _ = librosa.load(wav_fpath, sr=S3_SR)
+            self._target_ref_wav = target_16k
 
     # -------- Multi-reference target handling --------
     def set_target_voices(
@@ -223,18 +241,15 @@ class ChatterboxVC:
         speaker_ramp: bool | None = None,
         speaker_ramp_start: float = 0.6,
         ramp_shape: str = "sigmoid",
-        # Multi-segment & style modulation options
-        multi_ref_paths: list[str] | None = None,
-        multi_ref_mode: str = "mean",
-        multi_ref_robust: bool = True,
-        adain: bool = False,
+        enable_preprocessing: bool = None,
+        enable_postprocessing: bool = None,
+        preprocessing_strength: float = None,
+        postprocessing_strength: float = None,
     ):
-        if multi_ref_paths:
-            self.set_target_voices(multi_ref_paths, mode=multi_ref_mode, robust=multi_ref_robust)
-        elif target_voice_path:
+        if target_voice_path:
             self.set_target_voice(target_voice_path)
-        if self.ref_dict is None:
-            raise ValueError("No target reference conditioning available. Provide target_voice_path or multi_ref_paths.")
+        if target_voice_path is None:
+            assert self.ref_dict is not None, "Please `prepare_conditionals` first or specify `target_voice_path`"
 
         # Allow per-call overrides
         if speaker_strength is not None and hasattr(self.s3gen, 'set_speaker_strength'):
@@ -245,12 +260,28 @@ class ChatterboxVC:
             active_prune = int(prune_tokens)
         else:
             active_prune = self.prune_tokens
+        
+        # Processing flags with per-call overrides
+        use_preprocessing = enable_preprocessing if enable_preprocessing is not None else self.enable_preprocessing
+        use_postprocessing = enable_postprocessing if enable_postprocessing is not None else self.enable_postprocessing
+        pre_strength = preprocessing_strength if preprocessing_strength is not None else self.preprocessing_strength
+        post_strength = postprocessing_strength if postprocessing_strength is not None else self.postprocessing_strength
 
         with torch.inference_mode():
             audio_16, _ = librosa.load(audio, sr=S3_SR)
+            
+            # ========== PRE-PROCESSING ==========
+            if use_preprocessing:
+                print(f"[VC] Applying pre-processing (strength={pre_strength:.2f})...")
+                audio_16 = self.audio_processor.preprocess_source(
+                    audio_16, 
+                    target_median_f0=self._target_median_f0,
+                    aggressiveness=pre_strength
+                )
+            
             audio_16 = torch.from_numpy(audio_16).float().to(self.device)[None, ]
 
-            # Optional pitch matching BEFORE tokenization
+            # Optional pitch matching BEFORE tokenization (original code)
             if pitch_match and self._target_median_f0 is not None:
                 src_med_f0 = self._extract_median_f0(audio_16.squeeze(0).cpu().numpy(), S3_SR)
                 raw_shift = self._compute_semitone_shift(src_med_f0, self._target_median_f0, max_pitch_shift)
@@ -326,14 +357,28 @@ class ChatterboxVC:
                 if hasattr(self.s3gen, 'set_speaker_scale_schedule'):
                     self.s3gen.set_speaker_scale_schedule(None)
             # Now run inference with schedules applied
-            # Enable/disable AdaIN as requested
-            if hasattr(self.s3gen, 'set_adain_enabled'):
-                self.s3gen.set_adain_enabled(adain)
             wav, _ = self.s3gen.inference(
                 speech_tokens=s3_tokens,
                 ref_dict=self.ref_dict,
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
+            
+            # ========== POST-PROCESSING ==========
+            if use_postprocessing and self._target_ref_wav is not None:
+                print(f"[VC] Applying post-processing (strength={post_strength:.2f})...")
+                # Resample output to 16kHz for post-processing
+                wav_16k = librosa.resample(wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+                
+                # Apply post-processing
+                wav_16k = self.audio_processor.postprocess_output(
+                    wav_16k,
+                    self._target_ref_wav,
+                    aggressiveness=post_strength
+                )
+                
+                # Resample back to 24kHz
+                wav = librosa.resample(wav_16k, orig_sr=S3_SR, target_sr=S3GEN_SR)
+            
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 

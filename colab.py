@@ -30,6 +30,14 @@ PRUNE_TOKENS = 0            # 4–8 to reduce source leakage
 ENABLE_PITCH_MATCH = True  # Use pitch matching hook
 PITCH_TOLERANCE = 0.6      # Ignore tiny shifts (semitones)
 MAX_PITCH_SHIFT = 2.0       # Clamp extreme shifts
+
+# ========== NEW PROCESSING OPTIONS ==========
+ENABLE_PREPROCESSING = True      # Apply aggressive source neutralization
+PREPROCESSING_STRENGTH = 0.7     # 0.0-1.0, how much to remove source identity
+ENABLE_POSTPROCESSING = True     # Apply target speaker enhancement
+POSTPROCESSING_STRENGTH = 0.8    # 0.0-1.0, how strongly to push toward target
+# ============================================
+
 RUN_VARIANT_SWEEP = False  # Set True to automatically evaluate a small grid
 # Enable large grid sweep (set True to run after primary example). This supersedes RUN_VARIANT_SWEEP.
 RUN_LARGE_GRID = False
@@ -58,6 +66,10 @@ model = ChatterboxVC.from_pretrained(
     flow_cfg_rate=FLOW_CFG_RATE,
     speaker_strength=SPEAKER_STRENGTH,
     prune_tokens=PRUNE_TOKENS,
+    enable_preprocessing=ENABLE_PREPROCESSING,
+    enable_postprocessing=ENABLE_POSTPROCESSING,
+    preprocessing_strength=PREPROCESSING_STRENGTH,
+    postprocessing_strength=POSTPROCESSING_STRENGTH,
 )
 
 # Prepare target conditioning (single reference)
