@@ -12,7 +12,8 @@ so the model more strongly latches onto target speaker identity.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
+import time
 import warnings
 import numpy as np
 import librosa
@@ -172,38 +173,64 @@ class ReferencePreprocessConfig:
     stable_window_sec: float = 4.0
     use_stable_window: bool = True
     spectral_tilt: bool = True
+    fast_mode: bool = False  # if True: skip gate & stable-window & heavy pyin loop
 
 
-def preprocess_reference(path: str, cfg: ReferencePreprocessConfig = ReferencePreprocessConfig()) -> Tuple[np.ndarray, dict]:
-    y = load_and_trim(path, cfg.sr)
-    y = loudness_normalize(y, cfg.sr, cfg.target_lufs)
-    if cfg.apply_gate:
-        y = spectral_gate(y, cfg.sr)
-    if cfg.use_stable_window:
-        y = pick_stable_window(y, cfg.sr, win_sec=cfg.stable_window_sec)
+def preprocess_reference(path: str, cfg: ReferencePreprocessConfig = ReferencePreprocessConfig(), *, collect_timing: bool = False) -> Tuple[np.ndarray, Dict[str, Any]]:
+    t0 = time.time(); timing: Dict[str, float] = {}
+    y = load_and_trim(path, cfg.sr); timing['load_trim'] = time.time() - t0
+    t1 = time.time(); y = loudness_normalize(y, cfg.sr, cfg.target_lufs); timing['loudness'] = time.time() - t1
+    if cfg.fast_mode:
+        # Skip gate & stable window for speed
+        pass
+    else:
+        if cfg.apply_gate:
+            t2 = time.time(); y = spectral_gate(y, cfg.sr); timing['spectral_gate'] = time.time() - t2
+        if cfg.use_stable_window:
+            t3 = time.time(); y = pick_stable_window(y, cfg.sr, win_sec=cfg.stable_window_sec); timing['stable_window'] = time.time() - t3
     if cfg.spectral_tilt:
-        y = spectral_tilt_normalize(y)
+        t4 = time.time(); y = spectral_tilt_normalize(y); timing['spectral_tilt'] = time.time() - t4
     band = bandlimit(y, cfg.sr)
-    info = {
+    total = time.time() - t0
+    info: Dict[str, Any] = {
         "length_samples": int(len(y)),
         "sample_rate": cfg.sr,
         "band_variant": band is not None,
+        "total_sec": total,
     }
+    if collect_timing:
+        info['timing'] = timing
     return y, info
 
 
-def preprocess_source(path: str, reference_audio: np.ndarray, source_sr: int = 16000) -> np.ndarray:
-    y, _ = librosa.load(path, sr=source_sr, mono=True)
-    return neutralize_source(y.astype(np.float32), reference_audio.astype(np.float32), source_sr)
+def preprocess_source(path: str, reference_audio: np.ndarray, source_sr: int = 16000, *, fast_mode: bool = False, collect_timing: bool = False) -> np.ndarray | Tuple[np.ndarray, Dict[str, Any]]:
+    t0 = time.time(); y, _ = librosa.load(path, sr=source_sr, mono=True); t_load = time.time() - t0
+    # In fast mode skip formant smoothing (dominant cost) and only RMS match
+    if fast_mode:
+        ref_seg = reference_audio[:min(len(reference_audio), len(y))]
+        y_proc = match_rms(y.astype(np.float32), ref_seg)
+        peak = np.max(np.abs(y_proc)) + 1e-9
+        y_proc = y_proc / peak * 0.99
+        total = time.time() - t0
+        if collect_timing:
+            return y_proc.astype(np.float32), {"total_sec": total, "load": t_load, "fast_mode": True}
+        return y_proc.astype(np.float32)
+    t1 = time.time(); y_proc = neutralize_source(y.astype(np.float32), reference_audio.astype(np.float32), source_sr); t_neut = time.time() - t1
+    total = time.time() - t0
+    if collect_timing:
+        return y_proc.astype(np.float32), {"total_sec": total, "load": t_load, "neutralize": t_neut, "fast_mode": False}
+    return y_proc.astype(np.float32)
 
 # Convenience wrapper if both paths provided
 
-def preprocess_pair(reference_path: str, source_path: str) -> Tuple[np.ndarray, np.ndarray, ReferencePreprocessConfig]:
-    cfg = ReferencePreprocessConfig()
+def preprocess_pair(reference_path: str, source_path: str, *, fast_mode: bool = False) -> Tuple[np.ndarray, np.ndarray, ReferencePreprocessConfig]:
+    cfg = ReferencePreprocessConfig(fast_mode=fast_mode, apply_gate=not fast_mode, use_stable_window=not fast_mode)
     ref_audio, _ = preprocess_reference(reference_path, cfg)
-    # Downsample ref to 16k for source neutralization alignment segment
     ref_16 = librosa.resample(ref_audio, orig_sr=cfg.sr, target_sr=16000)
-    src_audio = preprocess_source(source_path, ref_16, source_sr=16000)
+    if fast_mode:
+        src_audio = preprocess_source(source_path, ref_16, source_sr=16000, fast_mode=True)
+    else:
+        src_audio = preprocess_source(source_path, ref_16, source_sr=16000)
     return ref_audio, src_audio, cfg
 
 __all__ = [

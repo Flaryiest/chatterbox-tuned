@@ -15,14 +15,47 @@ import librosa
 import numpy as np
 from IPython.display import Audio, display
 import time
+import os
+from datetime import datetime
+
+# Optional: attempt lightweight dependency installs when running inside Colab runtime (fresh environment)
+try:
+    IN_COLAB = 'google.colab' in str(get_ipython())  # type: ignore  # noqa
+except Exception:
+    IN_COLAB = False
+
+if IN_COLAB:
+    # Heuristic: install missing optional deps only if not already present
+    try:
+        import pyloudnorm  # noqa: F401
+    except ImportError:  # pragma: no cover
+        !pip -q install pyloudnorm soundfile scipy >/dev/null 2>&1  # type: ignore  # noqa
+
+from chatterbox import (
+    preprocess_reference,
+    preprocess_source,
+    ReferencePreprocessConfig,
+)
 
 from chatterbox.vc import ChatterboxVC
 from chatterbox.models.voice_encoder import VoiceEncoder
 
 # ---------------- User Config ----------------
 # (Only the final assignment to AUDIO_PATH is used; remove or comment out unused examples.)
-SOURCE_AUDIO = "/content/TaylorSwiftShort.wav"  # Active source
-TARGET_VOICE_PATH = "/content/Barack Obama.mp3"  # Single target reference
+SOURCE_AUDIO = "/content/TaylorSwiftShort.wav"  # Active source (unprocessed)
+TARGET_VOICE_PATH = "/content/Barack Obama.mp3"  # Single target reference (unprocessed)
+
+# Preprocessing toggles (do not alter original SOURCE_AUDIO / TARGET_VOICE_PATH paths)
+ENABLE_PREPROCESS_REFERENCE = True      # Clean & stabilize target reference
+ENABLE_PREPROCESS_SOURCE = True         # Neutralize source timbre prior to conversion
+FAST_PREPROCESS = True                  # Use fast_mode (skips gate & stable window & full neutralization)
+METRICS_USE_PREPROCESSED = True         # Whether metrics compare against preprocessed reference/source
+POST_SMOOTH_RASPINESS = True            # Apply light spectral smoothing after generation
+POST_SMOOTH_ALPHA = 0.15                # 0-1; higher = stronger smoothing
+
+# Output preprocessed artifact paths (kept separate to preserve original paths requested)
+PREPROCESSED_REFERENCE_PATH = "/content/target_reference_preproc.wav"
+PREPROCESSED_SOURCE_PATH = "/content/source_neutral_preproc.wav"
 
 FLOW_CFG_RATE =  0.70       # Strong style guidance (try 0.82–0.88 first if artifacts)
 SPEAKER_STRENGTH = 1.1     # Embedding scaling (1.15–1.30 typical)
@@ -52,16 +85,67 @@ MAX_RAMP_RUNS = None  # set an int to early stop the ramp grid
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
+# ---------------- Optional Preprocessing Stage ----------------
+def ts(msg: str):
+    print(f"[{datetime.utcnow().isoformat()}] {msg}")
+
+stage_times = {}
+stage_t0 = time.time()
+
+if ENABLE_PREPROCESS_REFERENCE or ENABLE_PREPROCESS_SOURCE:
+    ts("[PRE] Starting preprocessing pipeline ...")
+    ref_used_path = TARGET_VOICE_PATH
+    src_used_path = SOURCE_AUDIO
+    ref_audio_24k = None
+    # 1. Reference preprocessing
+    if ENABLE_PREPROCESS_REFERENCE:
+        try:
+            ref_cfg = ReferencePreprocessConfig(fast_mode=FAST_PREPROCESS, apply_gate=not FAST_PREPROCESS, use_stable_window=not FAST_PREPROCESS)
+            ref_audio_24k, ref_info = preprocess_reference(TARGET_VOICE_PATH, ref_cfg, collect_timing=True)
+            sf.write(PREPROCESSED_REFERENCE_PATH, ref_audio_24k, ref_info["sample_rate"])
+            ref_used_path = PREPROCESSED_REFERENCE_PATH
+            stage_times['ref_preprocess_sec'] = ref_info.get('total_sec', None)
+            ts(f"[PRE][REF] Saved preprocessed reference -> {ref_used_path} total={ref_info.get('total_sec')}s fast={FAST_PREPROCESS} timing={ref_info.get('timing', {})}")
+        except Exception as e:  # pragma: no cover
+            ts(f"[PRE][REF][WARN] Failed preprocessing reference ({e}); falling back to raw file")
+    # 2. Source preprocessing (needs reference downsampled)
+    if ENABLE_PREPROCESS_SOURCE:
+        try:
+            if ref_audio_24k is None:
+                # Load if not already done
+                temp_ref, _ = librosa.load(TARGET_VOICE_PATH, sr=24000, mono=True)
+            else:
+                temp_ref = ref_audio_24k
+            ref_16 = librosa.resample(temp_ref, orig_sr=24000, target_sr=16000)
+            src_result = preprocess_source(SOURCE_AUDIO, ref_16, source_sr=16000, fast_mode=FAST_PREPROCESS, collect_timing=True)
+            if isinstance(src_result, tuple):
+                src_neutral, src_info = src_result
+                stage_times['src_preprocess_sec'] = src_info.get('total_sec', None)
+            else:
+                src_neutral = src_result
+            sf.write(PREPROCESSED_SOURCE_PATH, src_neutral, 16000)
+            src_used_path = PREPROCESSED_SOURCE_PATH
+            ts(f"[PRE][SRC] Saved preprocessed source -> {src_used_path} fast={FAST_PREPROCESS} info={src_info if 'src_info' in locals() else {}}")
+        except Exception as e:  # pragma: no cover
+            ts(f"[PRE][SRC][WARN] Failed preprocessing source ({e}); falling back to raw file")
+else:
+    ref_used_path = TARGET_VOICE_PATH
+    src_used_path = SOURCE_AUDIO
+
+stage_times['preprocess_total_sec'] = time.time() - stage_t0 if (ENABLE_PREPROCESS_REFERENCE or ENABLE_PREPROCESS_SOURCE) else 0.0
+
 # ---------------- Load Model ----------------
+load_t0 = time.time()
 model = ChatterboxVC.from_pretrained(
     device,
     flow_cfg_rate=FLOW_CFG_RATE,
     speaker_strength=SPEAKER_STRENGTH,
     prune_tokens=PRUNE_TOKENS,
 )
+stage_times['model_load_sec'] = time.time() - load_t0
 
-# Prepare target conditioning (single reference)
-model.set_target_voice(TARGET_VOICE_PATH)
+# Prepare target conditioning (single reference) — use processed if enabled
+model.set_target_voice(ref_used_path)
 
 def generate_with_introspection(model, audio_path, target_path, **override):
     """Generate audio while logging active parameters and token stats."""
@@ -83,14 +167,38 @@ def generate_with_introspection(model, audio_path, target_path, **override):
     return wav
 
 # ---------------- Conversion (Primary) ----------------
+gen_t0 = time.time()
 wav = generate_with_introspection(
     model,
-    SOURCE_AUDIO,
-    TARGET_VOICE_PATH,
+    src_used_path,
+    ref_used_path,
     pitch_match=ENABLE_PITCH_MATCH,
     pitch_tolerance=PITCH_TOLERANCE,
     max_pitch_shift=MAX_PITCH_SHIFT,
 )
+stage_times['generation_sec'] = time.time() - gen_t0
+
+# ---------------- Optional Post Smoothing (Raspiness Mitigation) ----------------
+def post_spectral_smooth(wav_tensor, sr, alpha=0.15):
+    if alpha <= 0: return wav_tensor
+    y = wav_tensor.squeeze(0).cpu().numpy()
+    S = librosa.stft(y, n_fft=1024, hop_length=256)
+    mag, phase = np.abs(S), np.angle(S)
+    # Simple spectral moving average across frequency bins
+    k = 3
+    mag_pad = np.pad(mag, ((0,0),(k,k)), mode='edge')
+    smoothed = np.stack([mag_pad[:, i:i+mag.shape[1]] for i in range(2*k+1)], axis=0).mean(axis=0)
+    mag_interp = (1-alpha)*mag + alpha*smoothed
+    Y = mag_interp * np.exp(1j*phase)
+    y_out = librosa.istft(Y, hop_length=256)
+    if y_out is None:
+        return wav_tensor
+    return torch.from_numpy(y_out).float().unsqueeze(0)
+
+post_t0 = time.time()
+if POST_SMOOTH_RASPINESS:
+    wav = post_spectral_smooth(wav, model.sr, alpha=POST_SMOOTH_ALPHA)
+stage_times['post_smooth_sec'] = time.time() - post_t0 if POST_SMOOTH_RASPINESS else 0.0
 
 out_path = "/content/output.wav"
 sf.write(out_path, wav.squeeze(0).cpu().numpy(), model.sr)
@@ -98,6 +206,7 @@ sf.write(out_path, wav.squeeze(0).cpu().numpy(), model.sr)
 display(Audio(filename=out_path, rate=model.sr))
 print("Saved:", out_path)
 print(f"Settings -> flow_cfg_rate={FLOW_CFG_RATE}, speaker_strength={SPEAKER_STRENGTH}, prune_tokens={PRUNE_TOKENS}, pitch_match={ENABLE_PITCH_MATCH}")
+print("Timing Summary (seconds):", stage_times)
 
 # ---------------- Identity Shift Evaluation ----------------
 def load_embeds_utterance(path: str, ve: VoiceEncoder, sr_target: int = 16000):
@@ -118,8 +227,12 @@ def l2(a: torch.Tensor, b: torch.Tensor):
 
 voice_encoder = VoiceEncoder().to(device).eval()
 
-source_spk, source_partials = load_embeds_utterance(SOURCE_AUDIO, voice_encoder)
-target_spk, target_partials = load_embeds_utterance(TARGET_VOICE_PATH, voice_encoder)
+# Decide which paths to use for metric baselines
+metric_source_path = PREPROCESSED_SOURCE_PATH if (METRICS_USE_PREPROCESSED and ENABLE_PREPROCESS_SOURCE and os.path.exists(PREPROCESSED_SOURCE_PATH)) else SOURCE_AUDIO
+metric_target_path = PREPROCESSED_REFERENCE_PATH if (METRICS_USE_PREPROCESSED and ENABLE_PREPROCESS_REFERENCE and os.path.exists(PREPROCESSED_REFERENCE_PATH)) else TARGET_VOICE_PATH
+
+source_spk, source_partials = load_embeds_utterance(metric_source_path, voice_encoder)
+target_spk, target_partials = load_embeds_utterance(metric_target_path, voice_encoder)
 output_spk, output_partials = load_embeds_utterance(out_path, voice_encoder)
 
 sim_source_target = cosine(source_spk, target_spk)
@@ -164,8 +277,8 @@ Set RUN_VARIANT_SWEEP=True at top to enable. Produces a table of metrics for dif
 def run_variant(tag, flow_cfg_rate=None, speaker_strength=None, prune_tokens=None):
     wav_v = generate_with_introspection(
         model,
-        SOURCE_AUDIO,
-        TARGET_VOICE_PATH,
+        src_used_path,
+        ref_used_path,
         flow_cfg_rate=flow_cfg_rate,
         speaker_strength=speaker_strength,
         prune_tokens=prune_tokens,
@@ -249,8 +362,8 @@ def _eval_single(cfg_rate: float,
                  tag: str = "") -> RunResult:
     start = time.time()
     wav_local = model.generate(
-        audio=SOURCE_AUDIO,
-        target_voice_path=TARGET_VOICE_PATH,
+        audio=src_used_path,
+        target_voice_path=ref_used_path,
         flow_cfg_rate=cfg_rate,
         speaker_strength=speaker_strength,
         prune_tokens=0,
@@ -395,77 +508,4 @@ if RUN_LARGE_GRID:
     print("\n[GRID] Top 5 configurations:")
     for rr in combined_sorted[:5]:
         print(asdict(rr))
-
-# ---------------- Parameter Verification Utility ----------------
-"""Manual verification helper: run a miniature sweep over cfg_rate and speaker_strength
-and confirm that:
- 1. The internal flow trace reflects the requested cfg_rate (or schedule values).
- 2. Increasing cfg_rate or speaker_strength increases early-step diff_norm (up to saturation).
-
-Set RUN_VERIFY_PARAMS=True to execute. Adjust VERIFY_CFGS / VERIFY_STRENGTHS below.
-"""
-
-RUN_VERIFY_PARAMS = False
-VERIFY_CFGS = [0.0, 0.8, 1.6, 2.5]
-VERIFY_STRENGTHS = [1.0, 1.2, 1.4]
-VERIFY_SOURCE = SOURCE_AUDIO
-VERIFY_TARGET = TARGET_VOICE_PATH
-
-def verify_parameters(model, cfg_values, strength_values):
-    print("[VERIFY] Enabling trace...")
-    model.s3gen.enable_param_trace(True)
-    rows = []
-    for cfg in cfg_values:
-        model.s3gen.set_inference_cfg_rate(cfg)
-        for strength in strength_values:
-            model.s3gen.set_speaker_strength(strength)
-            wav_v = model.generate(
-                audio=VERIFY_SOURCE,
-                target_voice_path=VERIFY_TARGET,
-                flow_cfg_rate=cfg,
-                speaker_strength=strength,
-                prune_tokens=0,
-                pitch_match=ENABLE_PITCH_MATCH,
-                pitch_tolerance=PITCH_TOLERANCE,
-                max_pitch_shift=MAX_PITCH_SHIFT,
-            )
-            trace = model.s3gen.get_last_flow_trace() or []
-            if trace:
-                first = trace[0]
-                avg_diff = sum(t['diff_norm'] for t in trace) / len(trace)
-                rows.append({
-                    'cfg_rate': cfg,
-                    'speaker_strength': strength,
-                    'first_step_cfg_rate': first['cfg_rate'],
-                    'first_step_diff_norm': first['diff_norm'],
-                    'avg_diff_norm': avg_diff,
-                })
-            else:
-                rows.append({
-                    'cfg_rate': cfg,
-                    'speaker_strength': strength,
-                    'first_step_cfg_rate': None,
-                    'first_step_diff_norm': None,
-                    'avg_diff_norm': None,
-                })
-    # Basic monotonicity checks
-    print("\n[VERIFY] Results:")
-    for r in rows:
-        print(r)
-    # Group by speaker strength to see diff_norm vs cfg
-    print("\n[VERIFY] Monotonicity by speaker strength:")
-    from collections import defaultdict
-    by_strength = defaultdict(list)
-    for r in rows:
-        by_strength[r['speaker_strength']].append(r)
-    for strength, lst in by_strength.items():
-        lst_sorted = sorted(lst, key=lambda x: x['cfg_rate'])
-        diffs = [x['first_step_diff_norm'] for x in lst_sorted if x['first_step_diff_norm'] is not None]
-        trend = 'increasing' if all(diffs[i] <= diffs[i+1] for i in range(len(diffs)-1)) else 'non-monotonic'
-        print(f" speaker_strength={strength}: first_step_diff_norm sequence={diffs} -> {trend}")
-    model.s3gen.enable_param_trace(False)
-    return rows
-
-if RUN_VERIFY_PARAMS:
-    verify_parameters(model, VERIFY_CFGS, VERIFY_STRENGTHS)
 
