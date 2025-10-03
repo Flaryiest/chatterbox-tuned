@@ -66,11 +66,12 @@ from chatterbox.models.voice_encoder import VoiceEncoder
 
 # Try to import hybrid encoder (requires speechbrain)
 try:
-    from chatterbox.models.hybrid_voice_encoder import HybridVoiceEncoder
+    from chatterbox.models.hybrid_voice_encoder import HybridVoiceEncoder, HybridCAMPPlusEncoder
     HYBRID_ENCODER_AVAILABLE = True
 except ImportError:
     HYBRID_ENCODER_AVAILABLE = False
     HybridVoiceEncoder = None  # Define as None for isinstance checks
+    HybridCAMPPlusEncoder = None
 
 # ---------------- Installation (Run first in Colab) ----------------
 # !pip install scipy
@@ -643,21 +644,34 @@ model = ChatterboxVC.from_pretrained(
 )
 
 # Inject hybrid encoder into model if enabled
-if USE_HYBRID_ENCODER and HYBRID_ENCODER_AVAILABLE and HybridVoiceEncoder is not None:
+if USE_HYBRID_ENCODER and HYBRID_ENCODER_AVAILABLE and HybridCAMPPlusEncoder is not None:
     try:
-        log_step("\n🔧 Injecting hybrid encoder into voice conversion model...")
-        # Create hybrid encoder for model's use
-        model_hybrid_encoder = HybridVoiceEncoder(
-            lstm_encoder=VoiceEncoder().to(device).eval(),
+        log_step("\n🔧 Injecting HYBRID ENCODER into S3Gen speaker encoder...")
+        log_step("   (This replaces CAMPPlus X-Vector with ECAPA-guided version)")
+        
+        # Wrap the existing CAMPPlus encoder
+        original_campplus = model.s3gen.speaker_encoder
+        hybrid_campplus = HybridCAMPPlusEncoder(
+            campplus_encoder=original_campplus,
             device=device,
             projection_strength=HYBRID_PROJECTION_STRENGTH,
         ).to(device).eval()
-        # Replace model's voice encoder with hybrid version
-        model.voice_encoder = model_hybrid_encoder
-        log_step("✅ Model now using hybrid encoder for target voice embedding")
+        
+        # Replace in the model
+        model.s3gen.speaker_encoder = hybrid_campplus
+        log_step("✅ Hybrid encoder injected successfully!")
+        log_step(f"   Projection strength: {HYBRID_PROJECTION_STRENGTH:.2f}")
+        log_step("   This should break past embedding saturation!")
     except Exception as e:
-        log_step(f"⚠️  Failed to inject hybrid encoder into model: {e}")
-        log_step("   Model will use standard LSTM encoder")
+        log_step(f"⚠️  Failed to inject hybrid encoder: {e}")
+        log_step(f"   Error details: {type(e).__name__}")
+        log_step("   Model will use standard CAMPPlus encoder")
+        import traceback
+        traceback.print_exc()
+elif USE_HYBRID_ENCODER and not HYBRID_ENCODER_AVAILABLE:
+    log_step("\n⚠️  Hybrid encoder requested but speechbrain not installed")
+    log_step("   Install with: pip install speechbrain")
+    log_step("   Using standard CAMPPlus encoder")
 
 log_step("Model loaded successfully")
 
@@ -971,8 +985,8 @@ if sim_source_target > 0.999:
     print("   - Focus on model parameters (speaker_strength, prune_tokens, cfg_rate)")
     print("   - The small identity gain may be as good as this model can achieve")
     if USE_HYBRID_ENCODER and HYBRID_ENCODER_AVAILABLE:
-        if isinstance(voice_encoder, HybridVoiceEncoder):
-            print(f"   ✅ Hybrid encoder is ACTIVE (projection strength: {HYBRID_PROJECTION_STRENGTH:.2f})")
+        if isinstance(model.s3gen.speaker_encoder, HybridCAMPPlusEncoder) if HybridCAMPPlusEncoder else False:
+            print(f"   ✅ Hybrid CAMPPlus encoder is ACTIVE (projection strength: {HYBRID_PROJECTION_STRENGTH:.2f})")
             print(f"      Using ECAPA-TDNN to break past saturation ceiling!")
         else:
             print(f"   💡 TIP: Hybrid encoder failed to load - check speechbrain installation")
