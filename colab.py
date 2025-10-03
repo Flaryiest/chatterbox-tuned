@@ -3,26 +3,41 @@
 This script:
 1. Loads a pretrained ChatterboxVC model.
 2. Applies PREPROCESSING to remove source speaker characteristics:
+   
+   STANDARD STRATEGY (for similar voices):
    - Spectral Whitening: Removes source timbre/formant character
    - Dynamic Range Compression: Flattens emotional dynamics
    - Energy Envelope Transfer: Imposes target speaker's energy patterns
-3. Converts the preprocessed audio into target speaker voice.
+   
+   AGGRESSIVE STRATEGY (for very different voices) - NOW BALANCED:
+   - Moderate Spectral Smoothing: Gentle formant structure reduction via cepstral liftering
+   - Gentle Pitch Adaptation: Subtle pitch shift toward target (max ±2 semitones)
+   - Subtle Formant Shifting: Very gentle gender/age characteristic adjustment
+   - Moderate Dynamic Compression: Balanced emotional dynamics reduction
+   - Energy Envelope Transfer: Imposes target speaker's energy patterns
+   
+3. Converts the preprocessed audio into target speaker voice with configurable parameters.
 4. Applies POSTPROCESSING to enhance target similarity:
    - Spectral Morphing: Morphs output spectrum toward target characteristics
 5. Computes objective speaker similarity metrics with comparative analysis.
 
-PREPROCESSING PIPELINE (~2-5 seconds):
-  • Reduces source speaker "personality" and emotional signature
-  • Makes audio more neutral before voice conversion
-  • Expected improvement: 30-50% better target similarity
+WHEN TO USE AGGRESSIVE MODE:
+- Source and target are very different (different gender/age/language)
+- Standard preprocessing gives identity gain < 0.05
+- Voice encoder embeddings show source/target similarity > 0.995
+- You need maximum identity shift at the cost of some naturalness
 
-POSTPROCESSING PIPELINE (~1-2 seconds):
-  • Refines spectral characteristics to match target
-  • Additional 10-20% improvement over preprocessing alone
+CONFIGURATION:
+Set PREPROCESSING_STRATEGY = "aggressive" and USE_AGGRESSIVE_VC_PARAMS = True
+This enables BALANCED aggressive mode:
+- Moderate preprocessing (gentle source characteristic reduction)
+- Higher speaker_strength (1.25 vs 1.1)
+- Some token pruning (6 vs 0)
+- Stronger CFG guidance (1.0 vs 0.7)
+- Guidance/speaker ramping for progressive conditioning
+- Moderate postprocessing (0.65 vs 0.6 alpha)
 
-All phases include comprehensive logging with timestamps.
-
-Adjust the SOURCE_AUDIO and TARGET_VOICE_PATH below. The last assignment is the one used.
+NOTE: If audio becomes metallic/unrecognizable, use PREPROCESSING_STRATEGY="standard" instead.
 
 DEPENDENCIES: scipy (for signal processing)
 Install with: !pip install scipy
@@ -57,12 +72,28 @@ from chatterbox.models.voice_encoder import VoiceEncoder
 SOURCE_AUDIO = "/content/TaylorSwiftShort.wav"  # Active source
 TARGET_VOICE_PATH = "/content/Barack Obama.mp3"  # Single target reference
 
+# PREPROCESSING STRATEGY
+# "none" = No preprocessing, just use model parameters
+# "standard" = Original spectral methods (good for similar voices)
+# "aggressive" = Balanced preprocessing with pitch/formant adaptation (for different voices)
+PREPROCESSING_STRATEGY = "standard"  # Changed from "aggressive" - try this first
+
+# VOICE CONVERSION PARAMETERS (will be overridden by aggressive mode if enabled)
 FLOW_CFG_RATE =  0.70       # Strong style guidance (try 0.82–0.88 first if artifacts)
 SPEAKER_STRENGTH = 1.1     # Embedding scaling (1.15–1.30 typical)
 PRUNE_TOKENS = 0            # 4–8 to reduce source leakage
 ENABLE_PITCH_MATCH = True  # Use pitch matching hook
 PITCH_TOLERANCE = 0.6      # Ignore tiny shifts (semitones)
 MAX_PITCH_SHIFT = 2.0       # Clamp extreme shifts
+
+# AGGRESSIVE MODE OVERRIDES (used when PREPROCESSING_STRATEGY="aggressive")
+# These are now more BALANCED to prevent audio degradation
+USE_AGGRESSIVE_VC_PARAMS = True  # Override with stronger (but not extreme) parameters
+AGGRESSIVE_SPEAKER_STRENGTH = 1.25  # Reduced from 1.5
+AGGRESSIVE_PRUNE_TOKENS = 6         # Reduced from 12
+AGGRESSIVE_CFG_RATE = 1.0           # Reduced from 1.8
+AGGRESSIVE_POSTPROCESS_ALPHA = 0.65 # Reduced from 0.85
+
 RUN_VARIANT_SWEEP = False  # Set True to automatically evaluate a small grid
 # Enable large grid sweep (set True to run after primary example). This supersedes RUN_VARIANT_SWEEP.
 RUN_LARGE_GRID = False
@@ -182,6 +213,146 @@ def transfer_energy_envelope(source_audio, target_audio, sr):
     log_step(f"Energy envelope transfer complete in {elapsed:.3f}s")
     return result
 
+def gentle_pitch_adaptation(audio, sr, target_pitch=None, max_shift=3.0):
+    """Gently adapt pitch toward target (clamped to prevent artifacts)"""
+    log_step("Starting gentle pitch adaptation...")
+    start = time.time()
+    
+    try:
+        # Extract pitch
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            audio,
+            fmin=librosa.note_to_hz('C2'),
+            fmax=librosa.note_to_hz('C7'),
+            sr=sr
+        )
+        
+        # Get median pitch
+        valid_f0 = f0[~np.isnan(f0)]
+        if len(valid_f0) == 0 or target_pitch is None:
+            log_step("Skipping pitch adaptation (no valid pitch or target)")
+            elapsed = time.time() - start
+            log_step(f"Pitch adaptation skipped in {elapsed:.3f}s")
+            return audio
+        
+        source_median = np.median(valid_f0)
+        
+        # Calculate shift in semitones
+        shift_semitones = 12 * np.log2(target_pitch / source_median)
+        
+        # Clamp to prevent extreme artifacts
+        shift_semitones = np.clip(shift_semitones, -max_shift, max_shift)
+        
+        # Skip if shift is very small
+        if abs(shift_semitones) < 0.5:
+            log_step(f"Pitch shift too small ({shift_semitones:.2f} semitones), skipping")
+            elapsed = time.time() - start
+            log_step(f"Pitch adaptation skipped in {elapsed:.3f}s")
+            return audio
+        
+        log_step(f"Shifting pitch by {shift_semitones:.2f} semitones (from {source_median:.1f}Hz to {target_pitch:.1f}Hz)")
+        
+        # Apply pitch shift
+        shifted = librosa.effects.pitch_shift(audio, sr=sr, n_steps=shift_semitones)
+        
+        elapsed = time.time() - start
+        log_step(f"Gentle pitch adaptation complete in {elapsed:.3f}s")
+        return shifted
+    except Exception as e:
+        log_step(f"Pitch adaptation failed: {e}")
+        return audio
+
+def subtle_formant_shift(audio, sr, shift_factor=1.05):
+    """Subtle formant shifting (only if shift_factor differs from 1.0)"""
+    if abs(shift_factor - 1.0) < 0.01:
+        log_step("Skipping formant shift (factor too close to 1.0)")
+        return audio
+        
+    log_step(f"Starting subtle formant shifting (factor={shift_factor})...")
+    start = time.time()
+    
+    try:
+        # Use time stretching + resampling trick for formant shifting
+        # Stretch time
+        stretched = librosa.effects.time_stretch(audio, rate=1.0/shift_factor)
+        
+        # Resample back to original length (changes formants)
+        target_length = len(audio)
+        if len(stretched) != target_length:
+            formant_shifted = librosa.resample(
+                stretched,
+                orig_sr=sr/shift_factor,
+                target_sr=sr
+            )[:target_length]
+        else:
+            formant_shifted = stretched
+        
+        # Ensure same length
+        if len(formant_shifted) < target_length:
+            formant_shifted = np.pad(formant_shifted, (0, target_length - len(formant_shifted)))
+        elif len(formant_shifted) > target_length:
+            formant_shifted = formant_shifted[:target_length]
+        
+        elapsed = time.time() - start
+        log_step(f"Subtle formant shifting complete in {elapsed:.3f}s")
+        return formant_shifted
+    except Exception as e:
+        log_step(f"Formant shifting failed: {e}")
+        return audio
+
+def moderate_spectral_smoothing(audio, sr, alpha=0.5):
+    """Moderate spectral envelope smoothing to reduce speaker characteristics"""
+    log_step("Starting moderate spectral smoothing...")
+    start = time.time()
+    
+    if not PREPROCESSING_AVAILABLE:
+        log_step("Spectral smoothing skipped (scipy not available)")
+        return audio
+    
+    # STFT
+    stft = librosa.stft(audio, n_fft=2048, hop_length=512)
+    mag, phase = np.abs(stft), np.angle(stft)
+    
+    # Get spectral envelope through cepstral smoothing (but less aggressive)
+    log_mag = np.log(mag + 1e-8)
+    
+    try:
+        # Apply DCT to get cepstrum
+        from scipy.fftpack import dct, idct
+        cepstrum = dct(log_mag, axis=0, norm='ortho')
+        
+        # Keep more quefrency components (less aggressive than before)
+        lifter = 50  # Much less aggressive (was 20)
+        cepstrum_smoothed = cepstrum.copy()
+        cepstrum_smoothed[lifter:, :] = 0
+        
+        # Reconstruct smoothed envelope
+        smoothed_log_mag = idct(cepstrum_smoothed, axis=0, norm='ortho')
+        smoothed_mag = np.exp(smoothed_log_mag)
+        
+        # Blend with original (partial application)
+        blended_mag = mag ** (1 - alpha) * smoothed_mag ** alpha
+        
+        # Normalize to preserve energy
+        original_energy = np.sum(mag**2)
+        blended_energy = np.sum(blended_mag**2)
+        blended_mag = blended_mag * np.sqrt(original_energy / (blended_energy + 1e-8))
+        
+        # Reconstruct
+        result_stft = blended_mag * np.exp(1j * phase)
+        result = librosa.istft(result_stft, hop_length=512)
+    except Exception as e:
+        log_step(f"Cepstral smoothing failed ({e}), using simple whitening")
+        # Fallback to simple spectral whitening
+        envelope = scipy.ndimage.gaussian_filter1d(mag, sigma=5, axis=0)
+        whitened_mag = mag / (envelope ** alpha + 1e-8)
+        result_stft = whitened_mag * np.exp(1j * phase)
+        result = librosa.istft(result_stft, hop_length=512)
+    
+    elapsed = time.time() - start
+    log_step(f"Moderate spectral smoothing complete in {elapsed:.3f}s")
+    return result
+
 def spectral_morphing_postprocess(output_audio, target_audio, sr, alpha=0.6):
     """Morph output spectrum toward target's spectral characteristics"""
     if not PREPROCESSING_AVAILABLE:
@@ -228,7 +399,7 @@ def spectral_morphing_postprocess(output_audio, target_audio, sr, alpha=0.6):
     log_step(f"Spectral morphing complete in {elapsed:.3f}s")
     return result
 
-def preprocess_audio_pipeline(audio_path, target_path, sr=16000, enable_all=True):
+def preprocess_audio_pipeline(audio_path, target_path, sr=16000, enable_all=True, strategy="aggressive"):
     """Apply full preprocessing pipeline to improve target similarity
     
     Args:
@@ -236,12 +407,13 @@ def preprocess_audio_pipeline(audio_path, target_path, sr=16000, enable_all=True
         target_path: Path to target voice audio file
         sr: Sample rate for processing (default 16000)
         enable_all: If False, only loads audio without preprocessing
+        strategy: "standard" (original) or "aggressive" (new alternative approach)
     
     Returns:
         Preprocessed audio as numpy array
     """
     log_step("="*60)
-    log_step("STARTING PREPROCESSING PIPELINE")
+    log_step(f"STARTING PREPROCESSING PIPELINE (strategy={strategy})")
     log_step("="*60)
     
     if not PREPROCESSING_AVAILABLE:
@@ -260,14 +432,62 @@ def preprocess_audio_pipeline(audio_path, target_path, sr=16000, enable_all=True
     log_step(f"Target audio length: {len(target)/sr:.2f}s")
     
     if enable_all:
-        # 1. Spectral whitening (remove source timbre)
-        audio = spectral_whitening(audio, sr, alpha=0.7)
-        
-        # 2. Dynamic range compression (flatten dynamics)
-        audio = compress_dynamics(audio, sr, threshold_db=-20, ratio=4.0)
-        
-        # 3. Energy envelope transfer (impose target characteristics)
-        audio = transfer_energy_envelope(audio, target, sr)
+        if strategy == "none":
+            log_step("No preprocessing applied (strategy=none)")
+            # Return audio as-is
+            pass
+            
+        elif strategy == "aggressive":
+            log_step("Using BALANCED preprocessing strategy (reduced aggressiveness)")
+            
+            # Get target median pitch for optional adaptation
+            try:
+                target_f0, _, _ = librosa.pyin(
+                    target[:sr*10],  # Use first 10s
+                    fmin=librosa.note_to_hz('C2'),
+                    fmax=librosa.note_to_hz('C7'),
+                    sr=sr
+                )
+                valid_target_f0 = target_f0[~np.isnan(target_f0)]
+                target_median_pitch = np.median(valid_target_f0) if len(valid_target_f0) > 0 else None
+                if target_median_pitch:
+                    log_step(f"Target median pitch: {target_median_pitch:.1f}Hz")
+            except:
+                target_median_pitch = None
+            
+            # 1. Moderate spectral smoothing (gentle formant reduction)
+            audio = moderate_spectral_smoothing(audio, sr, alpha=0.4)  # Gentle (0.4 vs 0.7)
+            
+            # 2. Gentle pitch adaptation (only if significant difference)
+            audio = gentle_pitch_adaptation(audio, sr, target_pitch=target_median_pitch, max_shift=2.0)
+            
+            # 3. Very subtle formant shifting (if needed)
+            if target_median_pitch:
+                if target_median_pitch < 130:  # Male
+                    formant_factor = 0.97  # Very subtle shift down (was 0.88)
+                elif target_median_pitch > 190:  # Female
+                    formant_factor = 1.03  # Very subtle shift up (was 1.12)
+                else:
+                    formant_factor = 1.0  # Neutral
+                
+                audio = subtle_formant_shift(audio, sr, shift_factor=formant_factor)
+            
+            # 4. Moderate dynamic compression (reduce emotional dynamics)
+            audio = compress_dynamics(audio, sr, threshold_db=-20, ratio=4.5)  # More moderate (was 6.0)
+            
+            # 5. Energy envelope transfer (impose target characteristics)
+            audio = transfer_energy_envelope(audio, target, sr)
+            
+        else:  # Standard strategy
+            log_step("Using STANDARD preprocessing strategy")
+            # 1. Spectral whitening (remove source timbre)
+            audio = spectral_whitening(audio, sr, alpha=0.7)
+            
+            # 2. Dynamic range compression (flatten dynamics)
+            audio = compress_dynamics(audio, sr, threshold_db=-20, ratio=4.0)
+            
+            # 3. Energy envelope transfer (impose target characteristics)
+            audio = transfer_energy_envelope(audio, target, sr)
     
     pipeline_elapsed = time.time() - pipeline_start
     log_step("="*60)
@@ -308,15 +528,16 @@ def generate_with_introspection(model, audio_path, target_path, **override):
 
 # ---------------- Preprocessing Phase ----------------
 log_step("\n" + "="*80)
-log_step("PHASE 1: PREPROCESSING")
+log_step("PHASE 1: PREPROCESSING (AGGRESSIVE MODE)")
 log_step("="*80)
 
-# Apply preprocessing pipeline
+# Apply preprocessing pipeline with selected strategy
 preprocessed_audio = preprocess_audio_pipeline(
     SOURCE_AUDIO,
     TARGET_VOICE_PATH,
     sr=16000,
-    enable_all=True
+    enable_all=True,
+    strategy=PREPROCESSING_STRATEGY
 )
 
 # Save preprocessed audio for inspection
@@ -330,14 +551,48 @@ log_step("PHASE 2: VOICE CONVERSION")
 log_step("="*80)
 
 conversion_start = time.time()
-wav = generate_with_introspection(
-    model,
-    preprocessed_path,  # Use preprocessed audio
-    TARGET_VOICE_PATH,
-    pitch_match=ENABLE_PITCH_MATCH,
-    pitch_tolerance=PITCH_TOLERANCE,
-    max_pitch_shift=MAX_PITCH_SHIFT,
-)
+
+# Determine parameters based on preprocessing strategy
+if PREPROCESSING_STRATEGY == "aggressive" and USE_AGGRESSIVE_VC_PARAMS:
+    log_step("Using AGGRESSIVE voice conversion parameters:")
+    log_step(f"  - speaker_strength: {AGGRESSIVE_SPEAKER_STRENGTH} (baseline: {SPEAKER_STRENGTH})")
+    log_step(f"  - prune_tokens: {AGGRESSIVE_PRUNE_TOKENS} (baseline: {PRUNE_TOKENS})")
+    log_step(f"  - flow_cfg_rate: {AGGRESSIVE_CFG_RATE} (baseline: {FLOW_CFG_RATE})")
+    log_step("  - guidance_ramp: True (with min=0.3)")
+    log_step("  - speaker_ramp: True (starting at 0.5)")
+    
+    wav = model.generate(
+        audio=preprocessed_path,
+        target_voice_path=TARGET_VOICE_PATH,
+        speaker_strength=AGGRESSIVE_SPEAKER_STRENGTH,
+        prune_tokens=AGGRESSIVE_PRUNE_TOKENS,
+        flow_cfg_rate=AGGRESSIVE_CFG_RATE,
+        pitch_match=ENABLE_PITCH_MATCH,
+        pitch_tolerance=PITCH_TOLERANCE,
+        max_pitch_shift=MAX_PITCH_SHIFT,
+        guidance_ramp=True,
+        guidance_ramp_min=0.3,
+        speaker_ramp=True,
+        speaker_ramp_start=0.5,
+        ramp_shape="sigmoid",
+    )
+else:
+    log_step("Using STANDARD voice conversion parameters:")
+    log_step(f"  - speaker_strength: {SPEAKER_STRENGTH}")
+    log_step(f"  - prune_tokens: {PRUNE_TOKENS}")
+    log_step(f"  - flow_cfg_rate: {FLOW_CFG_RATE}")
+    
+    wav = model.generate(
+        audio=preprocessed_path,
+        target_voice_path=TARGET_VOICE_PATH,
+        speaker_strength=SPEAKER_STRENGTH,
+        prune_tokens=PRUNE_TOKENS,
+        flow_cfg_rate=FLOW_CFG_RATE,
+        pitch_match=ENABLE_PITCH_MATCH,
+        pitch_tolerance=PITCH_TOLERANCE,
+        max_pitch_shift=MAX_PITCH_SHIFT,
+    )
+
 conversion_elapsed = time.time() - conversion_start
 log_step(f"Voice conversion completed in {conversion_elapsed:.3f}s")
 
@@ -353,11 +608,19 @@ log_step("="*80)
 output_audio = wav.squeeze(0).cpu().numpy()
 target_audio, _ = librosa.load(TARGET_VOICE_PATH, sr=model.sr)
 
+# Apply postprocessing with appropriate aggressiveness
+if PREPROCESSING_STRATEGY == "aggressive" and USE_AGGRESSIVE_VC_PARAMS:
+    alpha_value = AGGRESSIVE_POSTPROCESS_ALPHA
+    log_step(f"Using AGGRESSIVE postprocessing (alpha={alpha_value})")
+else:
+    alpha_value = 0.6
+    log_step(f"Using STANDARD postprocessing (alpha={alpha_value})")
+
 postprocessed_audio = spectral_morphing_postprocess(
     output_audio,
     target_audio,
     model.sr,
-    alpha=0.6
+    alpha=alpha_value
 )
 
 postprocessed_path = "/content/output_postprocessed.wav"
@@ -489,6 +752,16 @@ else:
         print("   Good identity shift achieved.")
     else:
         print("   Moderate identity shift. Consider tuning preprocessing parameters.")
+
+# Add diagnosis for embedding saturation
+if sim_source_target > 0.999:
+    print("\n⚠️  EMBEDDING SATURATION DETECTED")
+    print(f"   Source/target similarity: {sim_source_target:.4f} (>0.999)")
+    print("   The voice encoder sees these speakers as nearly identical.")
+    print("   RECOMMENDATION: Preprocessing has limited effect in this case.")
+    print("   - Try using a different source or target voice")
+    print("   - Focus on model parameters (speaker_strength, prune_tokens, cfg_rate)")
+    print("   - The small identity gain may be as good as this model can achieve")
 
 # Optional: quick variant comparison (uncomment to explore)
 """Variant sweep helper.
