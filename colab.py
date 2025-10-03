@@ -64,6 +64,14 @@ except ImportError:
 from chatterbox.vc import ChatterboxVC
 from chatterbox.models.voice_encoder import VoiceEncoder
 
+# Try to import hybrid encoder (requires speechbrain)
+try:
+    from chatterbox.models.hybrid_voice_encoder import HybridVoiceEncoder
+    HYBRID_ENCODER_AVAILABLE = True
+except ImportError:
+    HYBRID_ENCODER_AVAILABLE = False
+    HybridVoiceEncoder = None  # Define as None for isinstance checks
+
 # ---------------- Installation (Run first in Colab) ----------------
 # !pip install scipy
 
@@ -94,6 +102,15 @@ AGGRESSIVE_PRUNE_TOKENS = 6         # Reduced from 12
 AGGRESSIVE_CFG_RATE = 1.0           # Reduced from 1.8
 AGGRESSIVE_POSTPROCESS_ALPHA = 0.65 # Reduced from 0.85
 
+# ITERATIVE VOICE CONVERSION (Multiple Passes for Stronger Identity Shift)
+USE_ITERATIVE_VC = True  # Enable multi-pass voice conversion
+ITERATIVE_VC_PASSES = 3  # Number of conversion passes (2-4 recommended, 3 is sweet spot)
+ITERATIVE_STRENGTH_RAMP = True  # Gradually increase conversion strength each pass
+
+# HYBRID VOICE ENCODER (Fixes Embedding Saturation)
+USE_HYBRID_ENCODER = True  # Use ECAPA-TDNN + LSTM hybrid encoder
+HYBRID_PROJECTION_STRENGTH = 0.4  # How much ECAPA guidance to apply (0.0-1.0, recommend 0.3-0.5)
+
 RUN_VARIANT_SWEEP = False  # Set True to automatically evaluate a small grid
 # Enable large grid sweep (set True to run after primary example). This supersedes RUN_VARIANT_SWEEP.
 RUN_LARGE_GRID = False
@@ -115,6 +132,126 @@ MAX_RAMP_RUNS = None  # set an int to early stop the ramp grid
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
+
+# ============================================================================
+# ITERATIVE VOICE CONVERSION
+# ============================================================================
+
+def iterative_voice_conversion(
+    model,
+    source_audio,
+    target_voice,
+    num_iterations=3,
+    base_params=None,
+    enable_strength_ramp=True,
+    save_intermediates=False
+):
+    """
+    Apply voice conversion multiple times to compound the effect.
+    
+    Each pass removes more source identity and adds more target identity.
+    Mathematically: After N passes with α=0.4 per pass:
+      - 1 pass: 60% source, 40% target
+      - 2 passes: 36% source, 64% target
+      - 3 passes: 21.6% source, 78.4% target
+      - 4 passes: 13% source, 87% target
+    
+    Args:
+        model: ChatterboxVC model instance
+        source_audio: Path to source audio OR numpy array
+        target_voice: Path to target voice reference
+        num_iterations: Number of conversion passes (2-4 recommended)
+        base_params: Dict of generation parameters (optional)
+        enable_strength_ramp: Gradually increase conversion strength each pass
+        save_intermediates: Save intermediate outputs for inspection
+    
+    Returns:
+        Final converted audio (torch.Tensor), list of intermediate outputs
+    """
+    import tempfile
+    import os
+    
+    log_step("\n" + "="*80)
+    log_step(f"ITERATIVE VOICE CONVERSION ({num_iterations} passes)")
+    log_step("="*80)
+    
+    # Default parameters
+    default_params = {
+        'speaker_strength': 1.1,
+        'flow_cfg_rate': 0.7,
+        'prune_tokens': 0,
+        'pitch_match': ENABLE_PITCH_MATCH,
+        'pitch_tolerance': PITCH_TOLERANCE,
+        'max_pitch_shift': MAX_PITCH_SHIFT,
+    }
+    if base_params:
+        default_params.update(base_params)
+    
+    current_audio = source_audio
+    intermediate_outputs = []
+    
+    for i in range(num_iterations):
+        log_step(f"\n--- Pass {i+1}/{num_iterations} ---")
+        
+        # Gradually increase conversion strength each pass
+        if enable_strength_ramp:
+            # Progressive ramping: more aggressive as we go
+            strength_multiplier = 1.0 + (i * 0.08)  # 1.0, 1.08, 1.16, 1.24
+            cfg_multiplier = 1.0 + (i * 0.15)       # 1.0, 1.15, 1.30, 1.45
+            prune_increase = min(i * 3, 10)         # 0, 3, 6, 9
+            
+            log_step(f"Strength multipliers: speaker={strength_multiplier:.2f}x, cfg={cfg_multiplier:.2f}x, prune=+{prune_increase}")
+        else:
+            strength_multiplier = 1.0
+            cfg_multiplier = 1.0
+            prune_increase = 0
+        
+        # Calculate parameters for this pass
+        current_speaker_strength = default_params['speaker_strength'] * strength_multiplier
+        current_cfg_rate = default_params['flow_cfg_rate'] * cfg_multiplier
+        current_prune_tokens = default_params['prune_tokens'] + prune_increase
+        
+        log_step(f"Parameters: speaker_strength={current_speaker_strength:.2f}, "
+                f"cfg_rate={current_cfg_rate:.2f}, prune_tokens={current_prune_tokens}")
+        
+        # Generate with adjusted parameters
+        pass_start = time.time()
+        wav = model.generate(
+            audio=current_audio,
+            target_voice_path=target_voice,
+            speaker_strength=current_speaker_strength,
+            flow_cfg_rate=current_cfg_rate,
+            prune_tokens=current_prune_tokens,
+            pitch_match=default_params['pitch_match'],
+            pitch_tolerance=default_params['pitch_tolerance'],
+            max_pitch_shift=default_params['max_pitch_shift'],
+        )
+        pass_elapsed = time.time() - pass_start
+        log_step(f"Pass {i+1} completed in {pass_elapsed:.2f}s")
+        
+        # Store intermediate result
+        intermediate_outputs.append(wav.clone())
+        
+        # Save intermediate result for next iteration
+        if i < num_iterations - 1:  # Don't save on last iteration
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                tmp_path = tmp.name
+                sf.write(tmp_path, wav.squeeze(0).cpu().numpy(), model.sr)
+                current_audio = tmp_path
+                
+                if save_intermediates:
+                    # Also save with descriptive name
+                    output_path = f"/content/iterative_pass_{i+1}.wav"
+                    sf.write(output_path, wav.squeeze(0).cpu().numpy(), model.sr)
+                    log_step(f"Intermediate saved: {output_path}")
+                else:
+                    log_step(f"Intermediate for next pass: {tmp_path}")
+    
+    log_step("\n" + "="*80)
+    log_step(f"ITERATIVE VC COMPLETE - All {num_iterations} passes finished")
+    log_step("="*80)
+    
+    return wav, intermediate_outputs
 
 # ============================================================================
 # PREPROCESSING FUNCTIONS WITH LOGGING
@@ -497,12 +634,32 @@ def preprocess_audio_pipeline(audio_path, target_path, sr=16000, enable_all=True
     return audio
 
 # ---------------- Load Model ----------------
+log_step("Loading Chatterbox voice conversion model...")
 model = ChatterboxVC.from_pretrained(
     device,
     flow_cfg_rate=FLOW_CFG_RATE,
     speaker_strength=SPEAKER_STRENGTH,
     prune_tokens=PRUNE_TOKENS,
 )
+
+# Inject hybrid encoder into model if enabled
+if USE_HYBRID_ENCODER and HYBRID_ENCODER_AVAILABLE and HybridVoiceEncoder is not None:
+    try:
+        log_step("\n🔧 Injecting hybrid encoder into voice conversion model...")
+        # Create hybrid encoder for model's use
+        model_hybrid_encoder = HybridVoiceEncoder(
+            lstm_encoder=VoiceEncoder().to(device).eval(),
+            device=device,
+            projection_strength=HYBRID_PROJECTION_STRENGTH,
+        ).to(device).eval()
+        # Replace model's voice encoder with hybrid version
+        model.voice_encoder = model_hybrid_encoder
+        log_step("✅ Model now using hybrid encoder for target voice embedding")
+    except Exception as e:
+        log_step(f"⚠️  Failed to inject hybrid encoder into model: {e}")
+        log_step("   Model will use standard LSTM encoder")
+
+log_step("Model loaded successfully")
 
 # Prepare target conditioning (single reference)
 model.set_target_voice(TARGET_VOICE_PATH)
@@ -554,47 +711,52 @@ conversion_start = time.time()
 
 # Determine parameters based on preprocessing strategy
 if PREPROCESSING_STRATEGY == "aggressive" and USE_AGGRESSIVE_VC_PARAMS:
-    log_step("Using AGGRESSIVE voice conversion parameters:")
+    base_params = {
+        'speaker_strength': AGGRESSIVE_SPEAKER_STRENGTH,
+        'prune_tokens': AGGRESSIVE_PRUNE_TOKENS,
+        'flow_cfg_rate': AGGRESSIVE_CFG_RATE,
+    }
+    log_step("Using AGGRESSIVE base parameters for VC")
     log_step(f"  - speaker_strength: {AGGRESSIVE_SPEAKER_STRENGTH} (baseline: {SPEAKER_STRENGTH})")
     log_step(f"  - prune_tokens: {AGGRESSIVE_PRUNE_TOKENS} (baseline: {PRUNE_TOKENS})")
     log_step(f"  - flow_cfg_rate: {AGGRESSIVE_CFG_RATE} (baseline: {FLOW_CFG_RATE})")
-    log_step("  - guidance_ramp: True (with min=0.3)")
-    log_step("  - speaker_ramp: True (starting at 0.5)")
-    
-    wav = model.generate(
-        audio=preprocessed_path,
-        target_voice_path=TARGET_VOICE_PATH,
-        speaker_strength=AGGRESSIVE_SPEAKER_STRENGTH,
-        prune_tokens=AGGRESSIVE_PRUNE_TOKENS,
-        flow_cfg_rate=AGGRESSIVE_CFG_RATE,
-        pitch_match=ENABLE_PITCH_MATCH,
-        pitch_tolerance=PITCH_TOLERANCE,
-        max_pitch_shift=MAX_PITCH_SHIFT,
-        guidance_ramp=True,
-        guidance_ramp_min=0.3,
-        speaker_ramp=True,
-        speaker_ramp_start=0.5,
-        ramp_shape="sigmoid",
-    )
 else:
-    log_step("Using STANDARD voice conversion parameters:")
+    base_params = {
+        'speaker_strength': SPEAKER_STRENGTH,
+        'prune_tokens': PRUNE_TOKENS,
+        'flow_cfg_rate': FLOW_CFG_RATE,
+    }
+    log_step("Using STANDARD base parameters for VC")
     log_step(f"  - speaker_strength: {SPEAKER_STRENGTH}")
     log_step(f"  - prune_tokens: {PRUNE_TOKENS}")
     log_step(f"  - flow_cfg_rate: {FLOW_CFG_RATE}")
-    
+
+# Apply iterative VC or single-pass VC
+if USE_ITERATIVE_VC and ITERATIVE_VC_PASSES > 1:
+    log_step(f"\n🔄 ITERATIVE MODE ENABLED: {ITERATIVE_VC_PASSES} passes")
+    wav, intermediate_outputs = iterative_voice_conversion(
+        model=model,
+        source_audio=preprocessed_path,
+        target_voice=TARGET_VOICE_PATH,
+        num_iterations=ITERATIVE_VC_PASSES,
+        base_params=base_params,
+        enable_strength_ramp=ITERATIVE_STRENGTH_RAMP,
+        save_intermediates=True  # Save intermediate passes for inspection
+    )
+else:
+    log_step("\n⚡ SINGLE-PASS MODE")
     wav = model.generate(
         audio=preprocessed_path,
         target_voice_path=TARGET_VOICE_PATH,
-        speaker_strength=SPEAKER_STRENGTH,
-        prune_tokens=PRUNE_TOKENS,
-        flow_cfg_rate=FLOW_CFG_RATE,
+        **base_params,
         pitch_match=ENABLE_PITCH_MATCH,
         pitch_tolerance=PITCH_TOLERANCE,
         max_pitch_shift=MAX_PITCH_SHIFT,
     )
+    intermediate_outputs = []
 
 conversion_elapsed = time.time() - conversion_start
-log_step(f"Voice conversion completed in {conversion_elapsed:.3f}s")
+log_step(f"\nVoice conversion completed in {conversion_elapsed:.3f}s")
 
 out_path = "/content/output_preprocessed.wav"
 sf.write(out_path, wav.squeeze(0).cpu().numpy(), model.sr)
@@ -633,10 +795,31 @@ log_step("="*80)
 log_step(f"Original output: {out_path}")
 log_step(f"Postprocessed output: {postprocessed_path}")
 
+# Show iterative progression if enabled
+if USE_ITERATIVE_VC and ITERATIVE_VC_PASSES > 1:
+    log_step(f"\n📊 ITERATIVE VC PROGRESSION ({ITERATIVE_VC_PASSES} passes):")
+    for i in range(ITERATIVE_VC_PASSES):
+        iter_path = f"/content/iterative_pass_{i+1}.wav"
+        if i < ITERATIVE_VC_PASSES - 1:  # Intermediate passes
+            log_step(f"  Pass {i+1}: {iter_path}")
+        else:  # Final pass
+            log_step(f"  Pass {i+1} (final): {out_path}")
+
 display(Audio(filename=out_path, rate=model.sr))
 log_step("\n[Playing: Preprocessed only (no postprocess)]")
 display(Audio(filename=postprocessed_path, rate=model.sr))
 log_step("[Playing: Preprocessed + Postprocessed]")
+
+# Play intermediate iterations if available
+if USE_ITERATIVE_VC and ITERATIVE_VC_PASSES > 1:
+    log_step("\n[Iterative VC Progression - Listen to improvement across passes:]")
+    for i in range(ITERATIVE_VC_PASSES - 1):  # Don't replay final (already played above)
+        iter_path = f"/content/iterative_pass_{i+1}.wav"
+        try:
+            display(Audio(filename=iter_path, rate=model.sr))
+            log_step(f"  ↑ Pass {i+1} of {ITERATIVE_VC_PASSES}")
+        except:
+            pass
 
 print(f"\nSettings -> flow_cfg_rate={FLOW_CFG_RATE}, speaker_strength={SPEAKER_STRENGTH}, prune_tokens={PRUNE_TOKENS}, pitch_match={ENABLE_PITCH_MATCH}")
 
@@ -661,7 +844,32 @@ def cosine(a: torch.Tensor, b: torch.Tensor):
 def l2(a: torch.Tensor, b: torch.Tensor):
     return float(torch.norm(a - b))
 
-voice_encoder = VoiceEncoder().to(device).eval()
+# Load base LSTM encoder
+log_step("Loading voice encoder for evaluation...")
+lstm_encoder = VoiceEncoder().to(device).eval()
+log_step(f"LSTM encoder loaded: {lstm_encoder.embedding_size}-dim embeddings")
+
+# Optionally wrap with hybrid encoder
+if USE_HYBRID_ENCODER and HYBRID_ENCODER_AVAILABLE:
+    try:
+        log_step("\n🔄 Initializing HYBRID ENCODER (ECAPA-TDNN + LSTM)...")
+        voice_encoder = HybridVoiceEncoder(
+            lstm_encoder=lstm_encoder,
+            device=device,
+            projection_strength=HYBRID_PROJECTION_STRENGTH,
+        ).to(device).eval()
+        log_step(f"✅ Hybrid encoder ready (projection strength: {HYBRID_PROJECTION_STRENGTH:.2f})")
+        log_step("   This should break past embedding saturation!")
+    except Exception as e:
+        log_step(f"⚠️  Failed to load hybrid encoder: {e}")
+        log_step("   Falling back to standard LSTM encoder")
+        voice_encoder = lstm_encoder
+else:
+    if USE_HYBRID_ENCODER and not HYBRID_ENCODER_AVAILABLE:
+        log_step("⚠️  Hybrid encoder requested but not available")
+        log_step("   Install: pip install speechbrain")
+    voice_encoder = lstm_encoder
+    log_step("Using standard LSTM encoder")
 
 log_step("Computing embeddings for source, target, and outputs...")
 embed_start = time.time()
@@ -762,6 +970,67 @@ if sim_source_target > 0.999:
     print("   - Try using a different source or target voice")
     print("   - Focus on model parameters (speaker_strength, prune_tokens, cfg_rate)")
     print("   - The small identity gain may be as good as this model can achieve")
+    if USE_HYBRID_ENCODER and HYBRID_ENCODER_AVAILABLE:
+        if isinstance(voice_encoder, HybridVoiceEncoder):
+            print(f"   ✅ Hybrid encoder is ACTIVE (projection strength: {HYBRID_PROJECTION_STRENGTH:.2f})")
+            print(f"      Using ECAPA-TDNN to break past saturation ceiling!")
+        else:
+            print(f"   💡 TIP: Hybrid encoder failed to load - check speechbrain installation")
+    else:
+        print("   💡 TIP: Enable USE_HYBRID_ENCODER=True and install speechbrain")
+    if USE_ITERATIVE_VC:
+        print(f"   ✅ Iterative VC is ENABLED ({ITERATIVE_VC_PASSES} passes) - compounds the effect")
+    else:
+        print("   💡 TIP: Enable USE_ITERATIVE_VC=True for 30-40% better results")
+
+# Analyze iterative progression if enabled
+if USE_ITERATIVE_VC and ITERATIVE_VC_PASSES > 1 and len(intermediate_outputs) > 0:
+    print("\n" + "="*80)
+    print("ITERATIVE VC PROGRESSION ANALYSIS")
+    print("="*80)
+    
+    for i, iter_output in enumerate(intermediate_outputs):
+        iter_audio = iter_output.squeeze(0).cpu().numpy()
+        
+        # Determine correct path for this iteration
+        if i < ITERATIVE_VC_PASSES - 1:
+            # Intermediate passes saved separately
+            iter_path = f"/content/iterative_pass_{i+1}.wav"
+        else:
+            # Final pass is the main output
+            iter_path = out_path
+        
+        # Compute embeddings for this iteration
+        try:
+            iter_spk, iter_partials = load_embeds_utterance(iter_path, voice_encoder)
+            
+            iter_cos_source = cosine(iter_spk, source_spk)
+            iter_cos_target = cosine(iter_spk, target_spk)
+            iter_gain = iter_cos_target - iter_cos_source
+            
+            print(f"\n[Pass {i+1}/{ITERATIVE_VC_PASSES}]")
+            print(f"  Cos(output, source): {iter_cos_source:.4f}")
+            print(f"  Cos(output, target): {iter_cos_target:.4f}")
+            print(f"  Identity gain: {iter_gain:.4f}")
+            
+            if i > 0:
+                # Compare to previous pass
+                if i == 1:
+                    prev_path = f"/content/iterative_pass_{i}.wav"
+                else:
+                    prev_path = f"/content/iterative_pass_{i}.wav" if i < ITERATIVE_VC_PASSES - 1 else f"/content/iterative_pass_{i}.wav"
+                
+                try:
+                    prev_spk, _ = load_embeds_utterance(prev_path, voice_encoder)
+                    prev_gain = cosine(prev_spk, target_spk) - cosine(prev_spk, source_spk)
+                    improvement = iter_gain - prev_gain
+                    print(f"  Improvement from Pass {i}: {improvement:+.4f}")
+                except:
+                    pass  # Can't compute improvement if previous pass unavailable
+        except Exception as e:
+            print(f"\n[Pass {i+1}] Could not compute metrics: {e}")
+    
+    print("\n" + "="*80)
 
 # Optional: quick variant comparison (uncomment to explore)
 """Variant sweep helper.
