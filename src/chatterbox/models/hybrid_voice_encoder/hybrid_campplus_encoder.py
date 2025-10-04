@@ -70,14 +70,14 @@ class HybridCAMPPlusEncoder(nn.Module):
             self.ecapa_available = True
             print("✅ ECAPA-TDNN loaded successfully")
             
-            # Initialize projection matrix (ECAPA 192-dim → CAMPPlus 80-dim)
-            self.projection = nn.Linear(192, 80, bias=False).to(device)
+            # Initialize projection matrix (ECAPA 192-dim → CAMPPlus 192-dim)
+            self.projection = nn.Linear(192, 192, bias=False).to(device)
             
             # Initialize with small random values
             with torch.no_grad():
-                self.projection.weight.data = torch.randn(80, 192, device=device) * 0.015
+                self.projection.weight.data = torch.randn(192, 192, device=device) * 0.015
             
-            print(f"Projection matrix initialized: 192-dim (ECAPA) → 80-dim (CAMPPlus)")
+            print(f"Projection matrix initialized: 192-dim (ECAPA) → 192-dim (CAMPPlus)")
             print(f"Projection strength: {projection_strength:.2f}")
             
         else:
