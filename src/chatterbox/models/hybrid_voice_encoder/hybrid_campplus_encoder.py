@@ -129,10 +129,10 @@ class HybridCAMPPlusEncoder(nn.Module):
             wav: Input waveform (B, T) at 16kHz
         
         Returns:
-            Adjusted CAMPPlus embedding (B, 80)
+            Adjusted CAMPPlus embedding (B, 192)
         """
         # Get original CAMPPlus embedding
-        campplus_embed = self.campplus_encoder.inference(wav)  # (B, 80)
+        campplus_embed = self.campplus_encoder.inference(wav)  # (B, 192)
         
         # If ECAPA not available, return original
         if not self.ecapa_available or self.projection_strength == 0.0:
@@ -144,24 +144,21 @@ class HybridCAMPPlusEncoder(nn.Module):
         
         try:
             ecapa_embed = self.embed_ecapa(wav_1d, sr=16000)  # Should be (192,)
-            print(f"DEBUG: ecapa_embed shape: {ecapa_embed.shape}, dtype: {ecapa_embed.dtype}, device: {ecapa_embed.device}")
-            print(f"DEBUG: campplus_embed shape: {campplus_embed.shape}, dtype: {campplus_embed.dtype}, device: {campplus_embed.device}")
             
             # Project ECAPA embedding to CAMPPlus space
             # This gives us a "refined" embedding based on ECAPA's better discrimination
             with torch.no_grad():
-                ecapa_projected = self.projection(ecapa_embed.unsqueeze(0)).squeeze(0)  # (80,)
-                print(f"DEBUG: ecapa_projected shape: {ecapa_projected.shape}")
+                ecapa_projected = self.projection(ecapa_embed.unsqueeze(0)).squeeze(0)  # (192,)
                 ecapa_projected = ecapa_projected.to(campplus_embed.device)  # Ensure same device
             
             # Blend CAMPPlus and projected ECAPA
             # projection_strength controls how much we trust ECAPA vs CAMPPlus
-            if campplus_embed.dim() == 2:  # (B, 80)
+            if campplus_embed.dim() == 2:  # (B, 192)
                 # Blend: (1-α) * CAMPPlus + α * ECAPA_projected
                 adjusted_embed = campplus_embed.clone()
                 adjusted_embed[0] = (1.0 - self.projection_strength) * campplus_embed[0] + \
                                    self.projection_strength * ecapa_projected
-            else:  # (80,)
+            else:  # (192,)
                 adjusted_embed = (1.0 - self.projection_strength) * campplus_embed + \
                                 self.projection_strength * ecapa_projected
             
@@ -171,7 +168,6 @@ class HybridCAMPPlusEncoder(nn.Module):
             else:
                 adjusted_embed = adjusted_embed / adjusted_embed.norm().clamp(min=1e-8)
             
-            print(f"DEBUG: Hybrid encoding successful!")
             return adjusted_embed
             
         except Exception as e:

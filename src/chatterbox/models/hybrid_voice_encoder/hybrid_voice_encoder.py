@@ -323,6 +323,20 @@ class HybridVoiceEncoder(nn.Module):
             self.projection.eval()
         return self
     
+    def embeds_from_wavs(self, wavs, sample_rate: int = 16000, as_spk: bool = False):
+        """
+        Compatibility method for evaluation - delegates to LSTM encoder.
+        
+        Args:
+            wavs: List of waveforms
+            sample_rate: Sample rate
+            as_spk: If True, return speaker-level embeddings (aggregated)
+        
+        Returns:
+            Embeddings array
+        """
+        return self.lstm_encoder.embeds_from_wavs(wavs, sample_rate=sample_rate, as_spk=as_spk)
+    
     @property
     def sr(self):
         """Sample rate (delegate to LSTM encoder)."""
