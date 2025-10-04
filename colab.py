@@ -861,7 +861,7 @@ def l2(a: torch.Tensor, b: torch.Tensor):
 # Load base LSTM encoder
 log_step("Loading voice encoder for evaluation...")
 lstm_encoder = VoiceEncoder().to(device).eval()
-log_step(f"LSTM encoder loaded: {lstm_encoder.embedding_size}-dim embeddings")
+log_step("LSTM encoder loaded: 256-dim embeddings")
 
 # Optionally wrap with hybrid encoder
 if USE_HYBRID_ENCODER and HYBRID_ENCODER_AVAILABLE:

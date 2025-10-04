@@ -143,22 +143,26 @@ class HybridCAMPPlusEncoder(nn.Module):
         wav_1d = wav[0] if wav.dim() == 2 else wav
         
         try:
-            ecapa_embed = self.embed_ecapa(wav_1d, sr=16000)  # (192,)
+            ecapa_embed = self.embed_ecapa(wav_1d, sr=16000)  # Should be (192,)
+            print(f"DEBUG: ecapa_embed shape: {ecapa_embed.shape}, dtype: {ecapa_embed.dtype}, device: {ecapa_embed.device}")
+            print(f"DEBUG: campplus_embed shape: {campplus_embed.shape}, dtype: {campplus_embed.dtype}, device: {campplus_embed.device}")
             
             # Project ECAPA embedding to CAMPPlus space
             # This gives us a "refined" embedding based on ECAPA's better discrimination
             with torch.no_grad():
                 ecapa_projected = self.projection(ecapa_embed.unsqueeze(0)).squeeze(0)  # (80,)
+                print(f"DEBUG: ecapa_projected shape: {ecapa_projected.shape}")
+                ecapa_projected = ecapa_projected.to(campplus_embed.device)  # Ensure same device
             
             # Blend CAMPPlus and projected ECAPA
             # projection_strength controls how much we trust ECAPA vs CAMPPlus
-            adjusted_embed = campplus_embed.clone()
-            if adjusted_embed.dim() == 2:  # (B, 80)
+            if campplus_embed.dim() == 2:  # (B, 80)
                 # Blend: (1-α) * CAMPPlus + α * ECAPA_projected
-                adjusted_embed[0] = (1.0 - self.projection_strength) * adjusted_embed[0] + \
+                adjusted_embed = campplus_embed.clone()
+                adjusted_embed[0] = (1.0 - self.projection_strength) * campplus_embed[0] + \
                                    self.projection_strength * ecapa_projected
             else:  # (80,)
-                adjusted_embed = (1.0 - self.projection_strength) * adjusted_embed + \
+                adjusted_embed = (1.0 - self.projection_strength) * campplus_embed + \
                                 self.projection_strength * ecapa_projected
             
             # Normalize (CAMPPlus embeddings are typically L2-normalized)
@@ -167,11 +171,18 @@ class HybridCAMPPlusEncoder(nn.Module):
             else:
                 adjusted_embed = adjusted_embed / adjusted_embed.norm().clamp(min=1e-8)
             
+            print(f"DEBUG: Hybrid encoding successful!")
             return adjusted_embed
             
         except Exception as e:
-            # If ECAPA fails, fall back to original
-            print(f"Warning: ECAPA embedding failed ({e}), using CAMPPlus only")
+            # If ECAPA fails, fall back to original - but don't print every time
+            if not hasattr(self, '_error_logged'):
+                print(f"Warning: ECAPA embedding failed ({e}), falling back to CAMPPlus only")
+                print(f"  This likely means projection matrix dimensions are wrong")
+                print(f"  Hybrid encoder will be disabled for this session")
+                import traceback
+                traceback.print_exc()
+                self._error_logged = True
             return campplus_embed
     
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
