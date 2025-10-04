@@ -404,6 +404,77 @@ if ENABLE_POSTPROCESSING:
 
 print(f"\nSettings -> flow_cfg_rate={FLOW_CFG_RATE}, speaker_strength={SPEAKER_STRENGTH}, prune_tokens={PRUNE_TOKENS}, pitch_match={ENABLE_PITCH_MATCH}")
 
+# ---------------- Encoder Discrimination Diagnostic ----------------
+if USE_HYBRID_ENCODER and HYBRID_ENCODER_AVAILABLE and isinstance(model.s3gen.speaker_encoder, HybridCAMPPlusEncoder):
+    log_step("\n" + "="*80)
+    log_step("ENCODER DISCRIMINATION DIAGNOSTIC")
+    log_step("="*80)
+    log_step("Comparing CAMPPlus vs ECAPA discrimination on source/target pair...")
+    
+    try:
+        import torch.nn.functional as F
+        
+        # Load source and target audio
+        source_wav, _ = librosa.load(SOURCE_AUDIO, sr=16000)
+        target_wav, _ = librosa.load(TARGET_VOICE_PATH, sr=16000)
+        
+        # Convert to tensors
+        source_tensor = torch.from_numpy(source_wav).unsqueeze(0).to(device)
+        target_tensor = torch.from_numpy(target_wav).unsqueeze(0).to(device)
+        
+        # Get raw CAMPPlus embeddings (192-dim)
+        campplus_only = model.s3gen.speaker_encoder.campplus_encoder
+        with torch.no_grad():
+            src_camp = campplus_only.inference(source_tensor)
+            tgt_camp = campplus_only.inference(target_tensor)
+        
+        # Get ECAPA embeddings (192-dim)
+        with torch.no_grad():
+            ecapa_src = model.s3gen.speaker_encoder.embed_ecapa(source_tensor[0], sr=16000)
+            ecapa_tgt = model.s3gen.speaker_encoder.embed_ecapa(target_tensor[0], sr=16000)
+        
+        # Compute similarities
+        camp_sim = F.cosine_similarity(src_camp, tgt_camp, dim=-1).item()
+        ecapa_sim = F.cosine_similarity(ecapa_src.unsqueeze(0), ecapa_tgt.unsqueeze(0), dim=-1).item()
+        
+        # Compute advantage (negative = ECAPA sees MORE difference)
+        ecapa_advantage = camp_sim - ecapa_sim
+        
+        print(f"\n📊 ENCODER DISCRIMINATION RESULTS:")
+        print(f"   CAMPPlus similarity:  {camp_sim:.6f}")
+        print(f"   ECAPA similarity:     {ecapa_sim:.6f}")
+        print(f"   ECAPA advantage:      {ecapa_advantage:.6f}")
+        
+        if ecapa_advantage > 0.01:
+            print(f"\n   ✅ ECAPA discriminates BETTER than CAMPPlus by {ecapa_advantage:.4f}")
+            print(f"      → Hybrid encoder should provide meaningful improvement!")
+        elif ecapa_advantage > 0.001:
+            print(f"\n   ⚠️  ECAPA slightly better than CAMPPlus by {ecapa_advantage:.4f}")
+            print(f"      → Hybrid encoder may provide small improvement")
+        elif ecapa_advantage > -0.001:
+            print(f"\n   ⚠️  ECAPA and CAMPPlus perform equally (difference: {abs(ecapa_advantage):.4f})")
+            print(f"      → Hybrid encoder unlikely to help with this pair")
+        else:
+            print(f"\n   ❌ ECAPA discriminates WORSE than CAMPPlus by {abs(ecapa_advantage):.4f}")
+            print(f"      → Hybrid encoder may degrade performance")
+        
+        # Analyze absolute discrimination
+        if camp_sim > 0.999 and ecapa_sim > 0.999:
+            print(f"\n   🔴 EXTREME SATURATION DETECTED (both >0.999)")
+            print(f"      Both encoders see these speakers as nearly identical!")
+            print(f"      RECOMMENDATION: Try different speaker pairs")
+        elif camp_sim > 0.995 and ecapa_sim > 0.995:
+            print(f"\n   🟡 HIGH SATURATION (both >0.995)")
+            print(f"      Limited room for improvement with any encoder")
+        else:
+            print(f"\n   🟢 MODERATE DISCRIMINATION (both <0.995)")
+            print(f"      Good test case for hybrid encoder!")
+        
+    except Exception as e:
+        log_step(f"⚠️  Encoder diagnostic failed: {e}")
+        import traceback
+        traceback.print_exc()
+
 # ---------------- Identity Shift Evaluation ----------------
 log_step("\n" + "="*80)
 log_step("PHASE 4: IDENTITY SHIFT EVALUATION")
